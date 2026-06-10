@@ -5491,12 +5491,31 @@ async function searchBoundary(q) {
       return;
     }
     r.innerHTML = '';
+    // Human-readable labels: help the user pick coastline-following objects
+    // (place=island etc.) over administrative ones (which include territorial
+    // waters for coastal/island areas).
+    const describe = (p) => {
+      if (p.class === 'place' && (p.type === 'island' || p.type === 'islet' || p.type === 'archipelago')) {
+        return { badge: '🏝 segue la costa', hint: 'Elemento naturale: il poligono si ferma alla terraferma', land: true };
+      }
+      if (p.class === 'boundary' && p.type === 'administrative') {
+        return { badge: '🏛 amministrativo', hint: 'Confine ufficiale: per coste e isole può includere le acque territoriali', land: false };
+      }
+      if (p.class === 'natural') {
+        return { badge: '🌿 naturale', hint: 'Elemento naturale', land: true };
+      }
+      return { badge: `${p.type} · ${p.class}`, hint: '', land: false };
+    };
+    // Island/natural results first — usually what the user wants for coastal areas.
+    polys.sort((a, b) => (describe(b).land ? 1 : 0) - (describe(a).land ? 1 : 0));
     for (const p of polys) {
+      const d = describe(p);
       const div = document.createElement('div');
       div.className = 'search-result';
+      div.title = d.hint;
       div.innerHTML = `
         <div>${escapeHtml(p.display_name)}</div>
-        <div class="meta">${p.type} · ${p.class}</div>
+        <div class="meta">${d.badge}</div>
       `;
       div.addEventListener('click', () => {
         addBoundary({
@@ -7300,9 +7319,13 @@ async function renderMapAtScale(scale, cropX, cropY, cropW, cropH) {
   }
 
   const sourceCanvas = map.getCanvas();
-  // After setPixelRatio, the canvas backing store already includes the scale, so
-  // the crop region must be measured in the new device pixels.
-  const effDpr = raised ? targetDpr : baseDpr;
+  // CRITICAL: MapLibre may silently CLAMP the requested pixelRatio when the
+  // resulting canvas would exceed WebGL texture-size limits (common at scale
+  // 3-4 on Retina). Never trust the requested ratio — measure the real one
+  // from the canvas backing store vs its CSS size. Using the wrong ratio made
+  // drawImage sample outside the canvas → fully transparent basemap.
+  const cssW = sourceCanvas.clientWidth || map.getContainer().clientWidth || 1;
+  const effDpr = sourceCanvas.width / cssW;
   const out = document.createElement('canvas');
   out.width = Math.round(cropW * scale);
   out.height = Math.round(cropH * scale);
@@ -7310,11 +7333,28 @@ async function renderMapAtScale(scale, cropX, cropY, cropW, cropH) {
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
 
+  // Clamp the source rect inside the canvas to be extra safe.
+  const sx = Math.max(0, Math.min(cropX * effDpr, sourceCanvas.width - 1));
+  const sy = Math.max(0, Math.min(cropY * effDpr, sourceCanvas.height - 1));
+  const sw = Math.min(cropW * effDpr, sourceCanvas.width - sx);
+  const sh = Math.min(cropH * effDpr, sourceCanvas.height - sy);
+
   ctx.drawImage(
     sourceCanvas,
-    cropX * effDpr, cropY * effDpr, cropW * effDpr, cropH * effDpr,
+    sx, sy, sw, sh,
     0, 0, out.width, out.height
   );
+
+  // Sanity check: if the capture came out fully transparent, warn loudly so a
+  // broken export never again fails silently.
+  try {
+    const probe = ctx.getImageData(Math.floor(out.width / 2), Math.floor(out.height / 2), 1, 1).data;
+    const corner = ctx.getImageData(2, 2, 1, 1).data;
+    if (probe[3] === 0 && corner[3] === 0) {
+      console.warn('Export capture appears BLANK', { effDpr, cssW, canvasW: sourceCanvas.width, sx, sy, sw, sh });
+      toast('Attenzione: lo sfondo catturato sembra vuoto. Riprova con uno scale più basso o segnala il problema.', 'warn', 8000);
+    }
+  } catch (e) { /* tainted canvas → handled downstream */ }
 
   // Restore pixelRatio
   if (raised) {
@@ -7438,12 +7478,25 @@ function buildExportSvg(cropX, cropY, cropW, cropH, baseDataUrl, scale) {
         if (pt.pending || !Number.isFinite(pt.lat) || !Number.isFinite(pt.lng)) continue;
         const p = project(pt.lng, pt.lat);
         if (!inCrop(p.x, p.y)) continue;
-        const inner = extractSvgInner(layer.icon || defaultMarkerSvg(layer.color));
+        // Normalize to the SAME size used on screen, then scale the viewBox
+        // coordinates down to that size in the transform. Without the scale()
+        // the raw path coordinates (often 0-512) render gigantic.
+        const normalized = normalizeSvgSize(layer.icon || defaultMarkerSvg(layer.color), layer.iconSize || 32);
+        const inner = extractSvgInner(normalized);
         const iw = inner.width || 24;
         const ih = inner.height || 32;
         const tx = p.x - iw / 2;
         const ty = p.y - ih;  // bottom anchor
-        layerSvg += `    <g transform="translate(${tx.toFixed(2)} ${ty.toFixed(2)})" data-label="${escapeHtml(pt.label || pt.address || '')}">${inner.body}</g>\n`;
+        let transform = `translate(${tx.toFixed(2)} ${ty.toFixed(2)})`;
+        if (inner.vb && (inner.vb.w !== iw || inner.vb.h !== ih || inner.vb.minX || inner.vb.minY)) {
+          const sx = iw / inner.vb.w;
+          const sy = ih / inner.vb.h;
+          transform += ` scale(${sx.toFixed(4)} ${sy.toFixed(4)})`;
+          if (inner.vb.minX || inner.vb.minY) {
+            transform += ` translate(${(-inner.vb.minX).toFixed(2)} ${(-inner.vb.minY).toFixed(2)})`;
+          }
+        }
+        layerSvg += `    <g transform="${transform}" data-label="${escapeHtml(pt.label || pt.address || '')}">${inner.body}</g>\n`;
         mc++;
       }
       if (mc > 0) {
@@ -7461,19 +7514,23 @@ function buildExportSvg(cropX, cropY, cropW, cropH, baseDataUrl, scale) {
 
 function extractSvgInner(svgString) {
   const m = svgString.match(/<svg[^>]*>([\s\S]*?)<\/svg>/);
-  if (!m) return { body: svgString, width: 24, height: 32 };
+  if (!m) return { body: svgString, width: 24, height: 32, vb: null };
   const attrs = svgString.match(/<svg([^>]*)>/)[1];
   const wMatch = attrs.match(/\bwidth="([\d.]+)"/);
   const hMatch = attrs.match(/\bheight="([\d.]+)"/);
   const vbMatch = attrs.match(/\bviewBox="([^"]+)"/);
+  let vb = null;
+  if (vbMatch) {
+    const p = vbMatch[1].split(/[\s,]+/).map(parseFloat);
+    if (p.length === 4 && p[2] > 0 && p[3] > 0) vb = { minX: p[0], minY: p[1], w: p[2], h: p[3] };
+  }
   let width = wMatch ? parseFloat(wMatch[1]) : null;
   let height = hMatch ? parseFloat(hMatch[1]) : null;
-  if ((!width || !height) && vbMatch) {
-    const vb = vbMatch[1].split(/\s+/).map(parseFloat);
-    width = width || vb[2];
-    height = height || vb[3];
+  if ((!width || !height) && vb) {
+    width = width || vb.w;
+    height = height || vb.h;
   }
-  return { body: m[1], width: width || 24, height: height || 32 };
+  return { body: m[1], width: width || 24, height: height || 32, vb };
 }
 
 function geometryToSvgPath(geom, project, style) {
