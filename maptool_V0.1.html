@@ -7281,105 +7281,103 @@ async function renderMapAtScale(scale, cropX, cropY, cropW, cropH) {
 
   const baseDpr = window.devicePixelRatio || 1;
 
-  // Wait helper: force a redraw and grab the frame on the next idle.
-  const settle = (timeoutMs) => new Promise(resolve => {
-    let done = false;
-    const grab = () => { if (done) return; done = true; resolve(); };
-    map.once('idle', grab);
-    map.redraw();
-    setTimeout(grab, timeoutMs);
+  // The crucial fix: even with preserveDrawingBuffer:true, the WebGL drawing
+  // buffer is reliably readable ONLY in the same tick as a paint. Reading it
+  // later (after idle + setTimeout, as before) returns an EMPTY buffer → blank
+  // export. So we copy the canvas synchronously INSIDE a 'render' callback.
+  const captureOnNextRender = () => new Promise(resolve => {
+    const onRender = () => {
+      // Copy immediately, synchronously, before the buffer is cleared.
+      const sourceCanvas = map.getCanvas();
+      const cssW = sourceCanvas.clientWidth || map.getContainer().clientWidth || sourceCanvas.width;
+      const cssH = sourceCanvas.clientHeight || map.getContainer().clientHeight || sourceCanvas.height;
+      const dprX = sourceCanvas.width / cssW;
+      const dprY = sourceCanvas.height / cssH;
+
+      const out = document.createElement('canvas');
+      out.width = Math.max(1, Math.round(cropW * scale));
+      out.height = Math.max(1, Math.round(cropH * scale));
+      const ctx = out.getContext('2d', { willReadFrequently: true });
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+
+      const sx = Math.max(0, Math.min(cropX * dprX, sourceCanvas.width - 1));
+      const sy = Math.max(0, Math.min(cropY * dprY, sourceCanvas.height - 1));
+      const sw = Math.min(cropW * dprX, sourceCanvas.width - sx);
+      const sh = Math.min(cropH * dprY, sourceCanvas.height - sy);
+
+      let blank = true;
+      try {
+        ctx.drawImage(sourceCanvas, sx, sy, sw, sh, 0, 0, out.width, out.height);
+        const pts = [[out.width >> 1, out.height >> 1], [2, 2], [out.width - 3, out.height - 3], [out.width >> 2, out.height >> 2]];
+        for (const [px, py] of pts) {
+          const d = ctx.getImageData(px, py, 1, 1).data;
+          if (d[3] !== 0) { blank = false; break; }
+        }
+      } catch (e) { console.error('capture drawImage failed', e); }
+
+      console.log('[export capture]', { scale, canvasW: sourceCanvas.width, canvasH: sourceCanvas.height, dprX: dprX.toFixed(2), blank });
+      map.off('render', onRender);
+      resolve({ canvas: out, blank });
+    };
+    map.on('render', onRender);
+    map.triggerRepaint();   // forces a paint → onRender fires with a fresh buffer
   });
 
-  // Capture the live canvas into an output canvas at the requested scale.
-  // Returns { canvas, blank } where blank=true if the grab was fully transparent.
-  const capture = () => {
-    const sourceCanvas = map.getCanvas();
-    // Measure the REAL device-pixel ratio from the canvas backing store.
-    const cssW = sourceCanvas.clientWidth || map.getContainer().clientWidth || sourceCanvas.width;
-    const cssH = sourceCanvas.clientHeight || map.getContainer().clientHeight || sourceCanvas.height;
-    const dprX = sourceCanvas.width / cssW;
-    const dprY = sourceCanvas.height / cssH;
-
-    const out = document.createElement('canvas');
-    out.width = Math.max(1, Math.round(cropW * scale));
-    out.height = Math.max(1, Math.round(cropH * scale));
-    const ctx = out.getContext('2d');
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
-
-    const sx = Math.max(0, Math.min(cropX * dprX, sourceCanvas.width - 1));
-    const sy = Math.max(0, Math.min(cropY * dprY, sourceCanvas.height - 1));
-    const sw = Math.min(cropW * dprX, sourceCanvas.width - sx);
-    const sh = Math.min(cropH * dprY, sourceCanvas.height - sy);
-
-    try {
-      ctx.drawImage(sourceCanvas, sx, sy, sw, sh, 0, 0, out.width, out.height);
-    } catch (e) {
-      console.error('drawImage failed', e);
-      return { canvas: out, blank: true, error: e };
-    }
-
-    // Blank detection: sample a few points.
-    let blank = true;
-    try {
-      const pts = [[out.width >> 1, out.height >> 1], [2, 2], [out.width - 3, out.height - 3], [out.width >> 2, out.height >> 2]];
-      for (const [px, py] of pts) {
-        const d = ctx.getImageData(px, py, 1, 1).data;
-        if (d[3] !== 0) { blank = false; break; }
-      }
-    } catch (e) { blank = false; /* tainted = can't read, assume non-blank */ }
-
-    console.log('[export capture]', { scale, canvasW: sourceCanvas.width, canvasH: sourceCanvas.height, cssW, cssH, dprX: dprX.toFixed(2), sx, sy, sw, sh, blank });
-    return { canvas: out, blank };
-  };
-
   let result = null;
+  let raised = false;
 
   // ---- Attempt 1: high-resolution via setPixelRatio ----
-  let raised = false;
   if (scale > 1) {
     try {
       map.setPixelRatio(baseDpr * scale);
       raised = true;
-      await settle(2500);
-      await new Promise(r => requestAnimationFrame(r));
-      result = capture();
-      if (result.blank) {
-        console.warn('[export] high-res capture blank → restoring ratio and retrying native');
-      }
+      // Let the higher-res tiles load before capturing.
+      await new Promise(resolve => {
+        let done = false;
+        const grab = () => { if (done) return; done = true; resolve(); };
+        map.once('idle', grab);
+        setTimeout(grab, 2500);
+      });
+      result = await captureOnNextRender();
+      if (result.blank) console.warn('[export] high-res blank → retry native');
     } catch (e) {
-      console.warn('[export] setPixelRatio path failed', e);
+      console.warn('[export] high-res path failed', e);
     }
   }
 
-  // ---- Restore pixel ratio BEFORE the fallback capture ----
-  if (raised) {
+  // ---- Restore pixel ratio before fallback ----
+  if (raised && (!result || result.blank)) {
     try { map.setPixelRatio(baseDpr); } catch (e) {}
-    await settle(800);
-    await new Promise(r => requestAnimationFrame(r));
+    await new Promise(resolve => {
+      let done = false;
+      const grab = () => { if (done) return; done = true; resolve(); };
+      map.once('idle', grab);
+      setTimeout(grab, 800);
+    });
   }
 
-  // ---- Attempt 2 (fallback OR primary for scale=1): native-ratio capture ----
+  // ---- Attempt 2: native-ratio capture (primary for scale=1, fallback otherwise) ----
   if (!result || result.blank) {
-    await settle(700);
-    await new Promise(r => requestAnimationFrame(r));
-    const native = capture();
-    // Prefer whichever is non-blank.
-    if (!native.blank) {
-      result = native;
-    } else if (!result) {
-      result = native;
-    }
+    await new Promise(resolve => {
+      let done = false;
+      const grab = () => { if (done) return; done = true; resolve(); };
+      map.once('idle', grab);
+      setTimeout(grab, 700);
+    });
+    const native = await captureOnNextRender();
+    if (!native.blank || !result) result = native;
   }
 
-  // Restore custom layer visibility
+  // Restore custom layer visibility + pixel ratio
+  if (raised) { try { map.setPixelRatio(baseDpr); } catch (e) {} }
   for (const c of customLayers) {
     try { map.setLayoutProperty(c.id, 'visibility', c.vis || 'visible'); } catch (e) {}
   }
-  try { map.redraw(); } catch (e) {}
+  try { map.triggerRepaint(); } catch (e) {}
 
   if (result.blank) {
-    toast('Lo sfondo non è catturabile (probabile blocco CORS di Safari da file://). Servi il tool via "python3 -m http.server" e apri http://localhost per includere lo sfondo.', 'warn', 11000);
+    toast('Lo sfondo risulta vuoto nonostante la cattura. Apri la console e segnala i valori [export capture].', 'warn', 10000);
   }
 
   return result.canvas;
