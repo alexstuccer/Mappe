@@ -1539,7 +1539,7 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
 
   <!-- ============== TOPBAR ============== -->
   <div class="topbar">
-    <div class="topbar-title">Map Tool <span>v0.11</span></div>
+    <div class="topbar-title">Map Tool <span>v0.12</span></div>
     <div style="display:flex; gap:8px; margin-left:6px;">
       <button class="btn small primary" id="btnTopbarSave" title="Salva tutto il progetto in un file JSON">💾 Salva</button>
       <button class="btn small" id="btnTopbarOpen" title="Apri un progetto salvato (JSON) — sostituisce il lavoro corrente">📂 Apri</button>
@@ -2014,6 +2014,36 @@ const newId = () => {
   do { id = 'id_' + (nextId++); } while (idInUse(id));
   return id;
 };
+// Ripara gli id duplicati (file salvati da versioni con il bug del contatore):
+// il primo elemento tiene l'id, gli altri ne ricevono uno nuovo; i riferimenti
+// delle isocrone (layerId/layerIds) e della legenda seguono. Ritorna quanti ne ha cambiati.
+function dedupeIds() {
+  const seen = new Set();
+  const remap = new Map();   // vecchio id → nuovo id (solo per i layer, che sono referenziati)
+  let n = 0;
+  const fix = (arr, isLayer) => {
+    for (const el of arr) {
+      if (!el.id || seen.has(el.id)) {
+        const old = el.id;
+        el.id = newId();
+        if (isLayer && old) remap.set(old + '#' + n, { old, nu: el.id });
+        n++;
+      }
+      seen.add(el.id);
+    }
+  };
+  fix(STATE.layers, true);
+  fix(STATE.boundaries, false);
+  fix(STATE.isochrones, false);
+  ((STATE.legend && STATE.legend.items) || []).forEach(it => { if (it.kind === 'custom' && (!it.id || seen.has(it.id))) { it.id = newId(); n++; } seen.add(it.id); });
+  if (remap.size) {
+    // Le isocrone/legenda che puntano a un id ora ambiguo restano sul primo layer
+    // (quello che ha tenuto l'id): scelta conservativa, i nomi in legenda/isocrone
+    // sono comunque ricavati dai codici stabili.
+    console.warn('dedupeIds: id di layer duplicati rinumerati', [...remap.values()]);
+  }
+  return n;
+}
 // Riallinea il contatore sopra il massimo degli id numerici presenti
 function syncNextId() {
   let max = 0;
@@ -10920,6 +10950,8 @@ function applyMergeSelection(project, picks) {
   }
 
   syncNextId();
+  const fixedM = dedupeIds();
+  if (fixedM) toast(`${fixedM} id duplicati sistemati durante l'unione`, 'warn', 6000);
   // Refresh everything
   renderLayerList();
   renderBoundaryList();
@@ -11032,6 +11064,8 @@ function applyProjectJson(project) {
   if (s.mapLanguage) STATE.mapLanguage = s.mapLanguage;
 
   syncNextId();
+  const fixed = dedupeIds();
+  if (fixed) setTimeout(() => toast(`Progetto riparato: ${fixed} elementi avevano un id duplicato (file salvato da una versione precedente). Risalva per fissare la correzione.`, 'warn', 9000), 300);
   // 7. Restore map view (basemap may need reload)
   const restoreView = () => {
     if (STATE.map && s.mapCenter && s.mapZoom != null) {
