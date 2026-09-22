@@ -1539,7 +1539,7 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
 
   <!-- ============== TOPBAR ============== -->
   <div class="topbar">
-    <div class="topbar-title">Map Tool <span>v0.9</span></div>
+    <div class="topbar-title">Map Tool <span>v0.11</span></div>
     <div style="display:flex; gap:8px; margin-left:6px;">
       <button class="btn small primary" id="btnTopbarSave" title="Salva tutto il progetto in un file JSON">💾 Salva</button>
       <button class="btn small" id="btnTopbarOpen" title="Apri un progetto salvato (JSON) — sostituisce il lavoro corrente">📂 Apri</button>
@@ -2001,7 +2001,29 @@ const STATE = {
 };
 
 let nextId = 1;
-const newId = () => 'id_' + (nextId++);
+// Un id non deve mai coincidere con uno già in uso: dopo il caricamento di un
+// progetto gli elementi conservano gli id salvati (id_1, id_2…) mentre il
+// contatore riparte da 1, e un layer nuovo finiva per condividere l'id con uno
+// caricato (editor icone, symbol layer e popup agivano sul layer sbagliato).
+function idInUse(id) {
+  return STATE.layers.some(l => l.id === id) || STATE.boundaries.some(b => b.id === id) ||
+    STATE.isochrones.some(i => i.id === id) || (STATE.legend && STATE.legend.items || []).some(it => it.id === id);
+}
+const newId = () => {
+  let id;
+  do { id = 'id_' + (nextId++); } while (idInUse(id));
+  return id;
+};
+// Riallinea il contatore sopra il massimo degli id numerici presenti
+function syncNextId() {
+  let max = 0;
+  const scan = id => { const m = /^id_(\d+)$/.exec(String(id || '')); if (m) max = Math.max(max, parseInt(m[1], 10)); };
+  STATE.layers.forEach(l => scan(l.id));
+  STATE.boundaries.forEach(b => scan(b.id));
+  STATE.isochrones.forEach(i => scan(i.id));
+  ((STATE.legend && STATE.legend.items) || []).forEach(it => scan(it.id));
+  nextId = Math.max(nextId, max + 1);
+}
 
 // Assign a stable 2-digit code ("00", "01", …) to a layer at creation time.
 // Codes never change once given, even if the layer is renamed, reordered or
@@ -3001,7 +3023,7 @@ function setupMapLayers() {
   }
   if (!STATE.map.getLayer('iso-line')) {
     STATE.map.addLayer({ id: 'iso-line', source: 'iso-line', type: 'line',
-      paint: { 'line-color': ['get', 'strokeColor'], 'line-width': 1.2,
+      paint: { 'line-color': ['get', 'strokeColor'], 'line-width': ['coalesce', ['get', 'strokeWidth'], 1.2],
         'line-offset': ['coalesce', ['get', '_lineOffset'], 0] }});
   }
   if (!STATE.map.getLayer('boundary-line')) {
@@ -3289,16 +3311,17 @@ async function expandFilesToEntries(files) {
     if (ext === 'xlsx' || ext === 'xls') {
       try {
         const buf = await file.arrayBuffer();
-        const wb = XLSX.read(buf, { type: 'array' });
+        const wb = XLSX.read(buf, { type: 'array' });   // parsato una volta: riusato dall'import
         const sheets = wb.SheetNames || [];
         if (sheets.length <= 1) {
-          out.push({ file, displayName: sanitizeLayerName(file.name) });
+          out.push({ file, wb, displayName: sanitizeLayerName(file.name) });
         } else {
           const picked = await askSheetPicker(file.name, sheets);
           if (!picked) continue; // user cancelled this file entirely
           for (const sname of picked) {
             out.push({
               file,
+              wb,
               sheetName: sname,
               displayName: sanitizeLayerName(file.name) + ' — ' + sname,
             });
@@ -3397,6 +3420,7 @@ function processNextMultiFile() {
   renderLayerList();
   openPointsImport(layer.id, {
     file: entry.file,
+    wb: entry.wb,
     sheetName: entry.sheetName,
     queuePos: { idx: MULTI.idx + 1, total: MULTI.entries.length },
   });
@@ -3558,6 +3582,7 @@ function openPointsImport(layerId, opts) {
       const fakeEvent = {
         target: { files: [opts.file], value: '' },
         __forcedSheet: opts.sheetName,  // optional: read this sheet, no picker
+        __wb: opts.wb,                  // workbook già parsato (evita un secondo XLSX.read)
       };
       handleFileImport(fakeEvent);
     }, 0);
@@ -3686,7 +3711,7 @@ async function handleFileImport(e) {
   const file = e.target.files[0];
   if (!file) return;
   try {
-    await _handleFileImportInner(file, e.__forcedSheet);
+    await _handleFileImportInner(file, e.__forcedSheet, e.__wb);
   } catch (err) {
     console.error('Import error:', err);
     toast('Errore durante l\'import del file: ' + (err.message || err) + ' — apri la console (⌥⌘C) per i dettagli.', 'error', 12000);
@@ -3696,7 +3721,7 @@ async function handleFileImport(e) {
   }
 }
 
-async function _handleFileImportInner(file, forcedSheet) {
+async function _handleFileImportInner(file, forcedSheet, wbGiven) {
   const ext = file.name.split('.').pop().toLowerCase();
   let rows = [];
   let headers = [];
@@ -3707,8 +3732,7 @@ async function _handleFileImportInner(file, forcedSheet) {
     rows = parsed.data;
     headers = parsed.meta.fields || [];
   } else if (ext === 'xlsx' || ext === 'xls') {
-    const buf = await file.arrayBuffer();
-    const wb = XLSX.read(buf, { type: 'array' });
+    const wb = wbGiven || XLSX.read(await file.arrayBuffer(), { type: 'array' });
     const sheetNames = wb.SheetNames || [];
     if (!sheetNames.length) { toast('Nessun foglio trovato nel file.', 'error'); return; }
     let targetSheet;
@@ -3767,8 +3791,8 @@ async function _handleFileImportInner(file, forcedSheet) {
     document.getElementById('colLng').value = flo;
   }
   // Trigger preview update + section muting on lat/lng changes
-  document.getElementById('colLat').addEventListener('change', updateSectionEnabled);
-  document.getElementById('colLng').addEventListener('change', updateSectionEnabled);
+  document.getElementById('colLat').onchange = updateSectionEnabled;   // assegnazione: niente doppioni ricaricando un file
+  document.getElementById('colLng').onchange = updateSectionEnabled;
 
   // Auto-detect address columns
   // Strategy: first look for a single "full address" column (ubicazione, sede, posizione, ...)
@@ -6335,10 +6359,25 @@ function registerPointHandlers() {
     const now = performance.now();
     if (now - lastHover < 60) return;
     lastHover = now;
-    const over = pointsAt(e.point, 6).length > 0;
+    const hits = pointsAt(e.point, 6);
+    const over = hits.length > 0;
     const canvas = map.getCanvas();
     if (over) canvas.style.cursor = 'pointer';
     else if (canvas.style.cursor === 'pointer' && !map.__shapeHover) canvas.style.cursor = '';
+    // Tooltip leggero con l'etichetta (sostituisce il title del vecchio marker DOM)
+    const key = over ? hits.map(h => h.layer.id + ':' + h.layer.points.indexOf(h.pt)).join('|') : '';
+    if (key !== map.__hoverKey) {
+      map.__hoverKey = key;
+      if (map.__hoverPopup) { map.__hoverPopup.remove(); map.__hoverPopup = null; }
+      if (over) {
+        const h0 = hits[0];
+        const text = hits.length === 1 ? (h0.pt.label || h0.pt.address || '') : `${hits.length} punti`;
+        if (text) {
+          map.__hoverPopup = new maplibregl.Popup({ closeButton: false, closeOnClick: false, offset: [0, -(h0.layer.iconSize || 32) - 4], className: 'pt-hover' })
+            .setLngLat([h0.pt.lng, h0.pt.lat]).setHTML(`<span style="font-size:11px;">${escapeHtml(text)}</span>`).addTo(map);
+        }
+      }
+    }
   });
   // Segnaposto trasparente per le icone richieste prima della rasterizzazione
   map.on('styleimagemissing', e => {
@@ -7119,8 +7158,7 @@ function openShapePopup(kind, owner, lngLat) {
     if (sw) sw.addEventListener('input', () => {
       const v = parseFloat(sw.value);
       if (isFinite(v)) {
-        if (isBoundary) owner.strokeWidth = v;
-        // (isochrones have fixed stroke width currently)
+        owner.strokeWidth = v;
       }
       refresh();
     });
@@ -8121,6 +8159,9 @@ function renderIsoList() {
             Opacità <input type="range" min="0" max="100" data-iid="${iso.id}" data-prop="opacity" value="${Math.round((iso.opacity||0)*100)}" style="flex:1;">
           </label>
           <label style="display:flex; align-items:center; gap:5px; font-size:11px; color:var(--text-secondary);">
+            Spessore <input type="number" min="0" max="30" step="0.5" data-iid="${iso.id}" data-prop="strokeWidth" value="${iso.strokeWidth != null ? iso.strokeWidth : 1.2}" style="width:58px; padding:2px 5px; font-family: var(--font-mono);">
+          </label>
+          <label style="display:flex; align-items:center; gap:5px; font-size:11px; color:var(--text-secondary);">
             Bordo
             <select data-iid="${iso.id}" data-prop="strokeAlignment" style="font-size:11px; padding:2px 5px;">
               <option value="center" ${(iso.strokeAlignment||'center')==='center'?'selected':''}>Centrato</option>
@@ -8153,6 +8194,7 @@ function renderIsoList() {
         if (!target) return;
         const prop = inp.dataset.prop;
         if (prop === 'opacity') target.opacity = parseInt(inp.value) / 100;
+        else if (prop === 'strokeWidth') { const v = parseFloat(inp.value); if (Number.isFinite(v)) target.strokeWidth = v; }
         else target[prop] = inp.value;
         // update swatch live
         const sw = li.querySelector('.item-swatch');
@@ -8190,11 +8232,11 @@ function redrawIsochrones() {
         geometry: f.geometry,
         properties: { _id: iso.id, fillColor: iso.color, fillOpacity: iso.opacity },
       });
-      const lineFeats_off = strokeOffsetPx(iso.strokeAlignment || 'center', 1.2);
+      const wpx = resolveStrokeWidthPx({ strokeWidth: iso.strokeWidth != null ? iso.strokeWidth : 1.2, strokeWidthMode: iso.strokeWidthMode });
       lineFeats.push({
         type: 'Feature',
         geometry: f.geometry,
-        properties: { _id: iso.id, strokeColor: iso.color, _lineOffset: lineFeats_off },
+        properties: { _id: iso.id, strokeColor: iso.color, strokeWidth: wpx, _lineOffset: strokeOffsetPx(iso.strokeAlignment || 'center', wpx) },
       });
     }
   }
@@ -8664,9 +8706,22 @@ function initLegendDrag() {
 
 /* ---------- export SVG ---------- */
 // Stima larghezza/altezza in unità (stessa metrica di cartogramma: ~6,2 unità per carattere)
+let _measureCtx = null;
+// Larghezza del testo in unità: misurata su canvas con lo stesso font dell'SVG
+// (Helvetica/Arial); stima a 0,54 em per carattere se il canvas non è disponibile.
+function textWidthUnits(s, px, bold) {
+  try {
+    if (_measureCtx === null) { const c = document.createElement('canvas'); _measureCtx = c.getContext('2d') || false; }
+    if (_measureCtx && _measureCtx.measureText) {
+      _measureCtx.font = `${bold ? 'bold ' : ''}${px}px Helvetica, Arial, sans-serif`;
+      const wpx = _measureCtx.measureText(String(s || '')).width;
+      if (Number.isFinite(wpx) && wpx > 0) return wpx;
+    }
+  } catch {}
+  return String(s || '').length * px * 0.54;
+}
 function legendMetrics(L, entries) {
-  const textW = s => String(s || '').length * 6.2;
-  const lw = Math.max(120, Math.max(L.title ? textW(L.title) * 1.08 : 0, ...entries.map(e => textW(e.label) + 33)) + LEGEND_PAD * 2);
+  const lw = Math.max(120, Math.max(L.title ? textWidthUnits(L.title, LEGEND_TITLE_FONT, true) : 0, ...entries.map(e => textWidthUnits(e.label, LEGEND_FONT) + 33)) + LEGEND_PAD * 2);
   const lh = (L.title ? 24 : 8) + entries.length * LEGEND_ROW + 8;
   return { lw: r2(lw), lh: r2(lh) };
 }
@@ -9096,7 +9151,9 @@ function buildExportSvg(V, baseDataUrl, opts) {
         fill: 'none',
         stroke: b.strokeColor,
         strokeWidth: strokeUnits(b, V),
-        dasharray: b.dashed ? '6,4' : null,
+        dashed: !!b.dashed,
+        align: b.strokeAlignment || 'center',
+        id: 'bnd-' + b.id,
       });
       svg += `  </g>\n`;
     }
@@ -9109,14 +9166,16 @@ function buildExportSvg(V, baseDataUrl, opts) {
     svg += `<g id="isochrones" inkscape:label="Isocrone">\n`;
     for (const iso of visIsos) {
       svg += `  <g id="iso-${idOf(iso.name)}" inkscape:label="${escapeHtml(iso.name || 'Isocrona')}">\n`;
-      for (const f of iso.geojson.features) {
+      iso.geojson.features.forEach((f, fi) => {
         svg += '    ' + geometryToSvgPath(f.geometry, project, {
           fill: iso.color,
           fillOpacity: iso.opacity,
           stroke: iso.color,
-          strokeWidth: 1,
+          strokeWidth: strokeUnits({ strokeWidth: iso.strokeWidth != null ? iso.strokeWidth : 1.2, strokeWidthMode: iso.strokeWidthMode }, V),
+          align: iso.strokeAlignment || 'center',
+          id: 'iso-' + iso.id + '-' + fi,
         });
-      }
+      });
       svg += `  </g>\n`;
     }
     svg += `</g>\n`;
@@ -9232,23 +9291,28 @@ function geometryToSvgPath(geom, project, style) {
   } else if (geom.type === 'MultiPolygon') {
     d = geom.coordinates.map(poly => poly.map(ringToPath).join(' ')).join(' ');
   }
-  let attrs = `fill="${style.fill}"`;
-  if (style.fillOpacity != null) attrs += ` fill-opacity="${style.fillOpacity}"`;
-  if (style.stroke) attrs += ` stroke="${style.stroke}"`;
-  if (style.strokeWidth != null) attrs += ` stroke-width="${style.strokeWidth}"`;
-  if (style.dasharray) attrs += ` stroke-dasharray="${style.dasharray}"`;
-  // Carry the global stroke caps/joins into the exported SVG so the deliverable
-  // matches what is shown on the map (MapLibre 'round' join -> SVG 'round').
-  if (style.stroke) {
-    const ss = STATE.strokeStyle || {};
-    const cap = ss.cap || 'round';
-    const join = ss.join || 'round';
-    // SVG linecap values match MapLibre (butt/round/square). For linejoin,
-    // MapLibre 'bevel'/'round'/'miter' map 1:1 to SVG.
-    attrs += ` stroke-linejoin="${join}" stroke-linecap="${cap}"`;
+  const ss = STATE.strokeStyle || {};
+  const capJoin = ` stroke-linejoin="${ss.join || 'round'}" stroke-linecap="${ss.cap || 'round'}"`;
+  const w = style.strokeWidth != null ? style.strokeWidth : 0;
+  // Tratteggio come a schermo: MapLibre lo esprime in multipli dello spessore (3,2)
+  const dash = style.dashed && w ? ` stroke-dasharray="${r2(3 * w)},${r2(2 * w)}"` : (style.dasharray ? ` stroke-dasharray="${style.dasharray}"` : '');
+  const strokeAttrs = style.stroke && style.stroke !== 'none' ? ` stroke="${style.stroke}" stroke-width="${w}"${dash}${capJoin}` : '';
+  const fillAttrs = `fill="${style.fill}"` + (style.fillOpacity != null ? ` fill-opacity="${style.fillOpacity}"` : '') + ` fill-rule="evenodd"`;
+
+  // Bordo interno/esterno (come line-offset a schermo): tratto a spessore doppio
+  // ritagliato dentro (clipPath) o fuori (mask) dal poligono.
+  const align = style.align || 'center';
+  if (strokeAttrs && w > 0 && (align === 'inside' || align === 'outside') && style.id) {
+    const w2 = r2(w * 2);
+    const strokeOnly = strokeAttrs.replace(`stroke-width="${w}"`, `stroke-width="${w2}"`)
+      .replace(/stroke-dasharray="[^"]*"/, m => style.dashed ? ` stroke-dasharray="${r2(3 * w)},${r2(2 * w)}"`.trim() : m);
+    const fillPath = style.fill !== 'none' ? `<path d="${d}" ${fillAttrs}/>\n` : '';
+    if (align === 'inside') {
+      return `<clipPath id="clip-${style.id}"><path d="${d}" fill-rule="evenodd"/></clipPath>\n${fillPath}<path d="${d}" fill="none"${strokeOnly} clip-path="url(#clip-${style.id})"/>\n`;
+    }
+    return `<mask id="mask-${style.id}" maskUnits="userSpaceOnUse" x="-100000" y="-100000" width="200000" height="200000"><rect x="-100000" y="-100000" width="200000" height="200000" fill="#ffffff"/><path d="${d}" fill="#000000" fill-rule="evenodd"/></mask>\n${fillPath}<path d="${d}" fill="none"${strokeOnly} mask="url(#mask-${style.id})"/>\n`;
   }
-  attrs += ` fill-rule="evenodd"`;
-  return `<path d="${d}" ${attrs}/>\n`;
+  return `<path d="${d}" ${fillAttrs}${strokeAttrs}/>\n`;
 }
 
 /* =============================================================================
@@ -10561,6 +10625,7 @@ function buildProjectJson() {
     minutes: i.minutes,
     profile: i.profile,
     provider: i.provider,
+    strokeWidth: i.strokeWidth,
     color: i.color,
     opacity: i.opacity,
     geojson: i.geojson,
@@ -10842,6 +10907,7 @@ function applyMergeSelection(project, picks) {
         minutes: iso.minutes,
         profile: iso.profile,
         provider: iso.provider,
+        strokeWidth: iso.strokeWidth,
         color: iso.color || '#0d99ff',
         opacity: iso.opacity != null ? iso.opacity : 0.35,
         geojson: iso.geojson,
@@ -10853,6 +10919,7 @@ function applyMergeSelection(project, picks) {
     }
   }
 
+  syncNextId();
   // Refresh everything
   renderLayerList();
   renderBoundaryList();
@@ -10939,6 +11006,7 @@ function applyProjectJson(project) {
       minutes: i.minutes,
       profile: i.profile,
       provider: i.provider,
+      strokeWidth: i.strokeWidth,
       color: i.color || '#0d99ff',
       opacity: i.opacity != null ? i.opacity : 0.35,
       geojson: i.geojson,
@@ -10963,6 +11031,7 @@ function applyProjectJson(project) {
   if (s.strokeStyle) STATE.strokeStyle = { ...s.strokeStyle };
   if (s.mapLanguage) STATE.mapLanguage = s.mapLanguage;
 
+  syncNextId();
   // 7. Restore map view (basemap may need reload)
   const restoreView = () => {
     if (STATE.map && s.mapCenter && s.mapZoom != null) {
