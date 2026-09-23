@@ -980,6 +980,7 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
   }
   .item {
     display: flex;
+    flex-wrap: wrap;            /* le righe di stile (flex-basis 100%) vanno a capo invece di uscire dal pannello */
     align-items: center;
     gap: 8px;
     padding: 7px 8px;
@@ -1165,6 +1166,13 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
   }
   .frame-handle.ne, .frame-handle.sw { cursor: nesw-resize; }
   .frame-handle.c { border-radius: 50%; background: #d4145a; cursor: move; }
+
+  /* Righe di stile dentro le liste: nessun elemento più largo del pannello */
+  .iso-style-row, .iso-style-row > div { width: 100%; min-width: 0; }
+  .iso-style-row input[type=range], .sp-row input[type=range] { min-width: 0; }
+  .item .sp-row { flex-wrap: wrap; }
+  .item .sp-row .val { width: auto; white-space: normal; text-align: left; flex-basis: 100%; }
+  .item .sp-row label { width: auto; }
 
   /* ---------- Legenda (overlay sulla mappa) ---------- */
   .map-legend {
@@ -2176,7 +2184,7 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
 
   <!-- ============== TOPBAR ============== -->
   <div class="topbar">
-    <div class="topbar-title">Map Tool <span>v0.18</span></div>
+    <div class="topbar-title">Map Tool <span>v0.19</span></div>
     <div style="display:flex; gap:8px; margin-left:6px;">
       <button class="btn small primary" id="btnTopbarSave" title="Salva tutto il progetto in un file JSON">💾 Salva</button>
       <button class="btn small" id="btnTopbarOpen" title="Apri un progetto salvato (JSON) — sostituisce il lavoro corrente">📂 Apri</button>
@@ -2582,8 +2590,8 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
           <span class="label" style="display: flex; align-items: center; gap: 6px;"><input type="checkbox" id="exportGray"> Sfondo in scala di grigi</span>
         </label>
         <label class="field" style="margin-bottom: 0;">
-          <span class="label" style="display: flex; align-items: center; gap: 6px;"><input type="checkbox" id="exportCurves" checked> Confini e isocrone come curve di Bézier (come "Semplifica" di Inkscape)</span>
-          <div class="help">Le spezzate diventano curve lisce con pochi nodi, entro la tolleranza di semplificazione della forma (0,75 unità se non semplificata). Spegni per avere i vertici esatti.</div>
+          <span class="label" style="display: flex; align-items: center; gap: 6px;"><input type="checkbox" id="exportCurves" checked> Curve di Bézier sulle forme semplificate (a schermo e nell'SVG)</span>
+          <div class="help">Le forme con "Semplifica" attivo diventano curve lisce con pochi nodi, entro la tolleranza scelta: a schermo la vedi già così, e nel file sono comandi C con gli stessi punti di controllo. Le forme non semplificate escono nel file come curve fini (0,75 unità); spegni per i vertici esatti.</div>
         </label>
       </div>
 
@@ -8061,26 +8069,97 @@ function simplifyFeature(feature, meters) {
     return (out && out.geometry && countVertices(out.geometry) >= 4) ? out : feature;
   } catch (e) { console.warn('simplify', e); return feature; }
 }
-// Confine: Feature semplificata (cache per tolleranza)
-function boundaryFeature(b) {
-  const tol = b.simplify || 0;
-  if (!tol) return b.feature;
-  if (!b._simp || b._simp.tol !== tol || b._simp.src !== b.feature) b._simp = { tol, src: b.feature, feature: simplifyFeature(b.feature, tol) };
-  return b._simp.feature;
+/* ---------- Curve di Bézier sulle forme semplificate ----------
+   Con l'opzione "curve" attiva, dopo Douglas-Peucker ogni anello viene adattato
+   con curve cubiche (Schneider/fitCurve) in un sistema locale in metri, UNA volta
+   sola. Da quelle stesse curve escono la spezzata fitta disegnata a schermo
+   (curva appiattita a passi ≤ tolleranza/2, quindi liscia) e i comandi C dell'SVG:
+   quello che vedi è quello che esporti. */
+function curvesEnabled() { const el = document.getElementById('exportCurves'); return el ? el.checked : true; }
+function ringLocalFrame(ring) {
+  const lat0 = ring[0][1], lon0 = ring[0][0], kx = Math.cos(lat0 * Math.PI / 180) * 111320, ky = 111320;
+  return { toLocal: c => [(c[0] - lon0) * kx, (c[1] - lat0) * ky], toGeo: p => [p[0] / kx + lon0, p[1] / ky + lat0] };
 }
-// Isocrona: array di Feature semplificate
-function isoFeatures(iso) {
+// Segmenti [[p0,c1,c2,p1],...] in lon/lat per un anello, oppure null se non adattabile
+function fitRingCurves(ring, tolM) {
+  if (typeof fitCurve !== 'function' || !ring || ring.length < 4) return null;
+  const F = ringLocalFrame(ring);
+  const pts = [];
+  for (const c of ring) { const p = F.toLocal(c); if (!pts.length || Math.hypot(p[0] - pts[pts.length - 1][0], p[1] - pts[pts.length - 1][1]) > 1e-3) pts.push(p); }
+  if (pts.length > 1 && Math.hypot(pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]) < 1e-3) pts.pop();
+  if (pts.length < 4 || pts.length > 8000) return null;
+  pts.push(pts[0]);
+  let segs;
+  try { segs = fitCurve(pts, Math.pow(Math.max(tolM, 1), 2)); } catch (e) { return null; }
+  if (!segs || !segs.length) return null;
+  return segs.map(s => s.map(F.toGeo));
+}
+const bez = (s, t) => { const u = 1 - t; return [u*u*u*s[0][0] + 3*u*u*t*s[1][0] + 3*u*t*t*s[2][0] + t*t*t*s[3][0], u*u*u*s[0][1] + 3*u*u*t*s[1][1] + 3*u*t*t*s[2][1] + t*t*t*s[3][1]]; };
+// Curve → anello di punti (per lo schermo): passi ≤ tol/2 in metri, tra 4 e 32 per segmento
+function flattenCurves(segs, tolM) {
+  const out = [segs[0][0]];
+  for (const s of segs) {
+    const F = ringLocalFrame([s[0]]);
+    const a = F.toLocal(s[0]), b1 = F.toLocal(s[1]), b2 = F.toLocal(s[2]), d = F.toLocal(s[3]);
+    const len = Math.hypot(b1[0] - a[0], b1[1] - a[1]) + Math.hypot(b2[0] - b1[0], b2[1] - b1[1]) + Math.hypot(d[0] - b2[0], d[1] - b2[1]);
+    const n = Math.max(4, Math.min(32, Math.ceil(len / Math.max(tolM / 2, 2))));
+    for (let i = 1; i <= n; i++) out.push(bez(s, i / n));
+  }
+  const f = out[0], l = out[out.length - 1];
+  if (Math.abs(f[0] - l[0]) > 1e-12 || Math.abs(f[1] - l[1]) > 1e-12) out.push([f[0], f[1]]);
+  return out;
+}
+// Geometria semplificata → { feature (appiattita), curveRings (allineati agli anelli, null = spezzata) }
+function curveGeometry(feature, tolM) {
+  const g = feature.geometry;
+  const rings = [];
+  const conv = ring => { const segs = fitRingCurves(ring, tolM); rings.push(segs); return segs ? flattenCurves(segs, tolM) : ring; };
+  let coords;
+  if (g.type === 'Polygon') coords = g.coordinates.map(conv);
+  else if (g.type === 'MultiPolygon') coords = g.coordinates.map(poly => poly.map(conv));
+  else return { feature, curveRings: null };
+  return { feature: { type: 'Feature', properties: feature.properties || {}, geometry: { type: g.type, coordinates: coords } }, curveRings: rings };
+}
+
+// Confine: Feature semplificata (e, con le curve attive, appiattita dalle curve). Cache per tolleranza.
+function boundarySimp(b) {
+  const tol = b.simplify || 0;
+  if (!tol) return { feature: b.feature, curveRings: null };
+  const cv = curvesEnabled();
+  if (!b._simp || b._simp.tol !== tol || b._simp.src !== b.feature || b._simp.cv !== cv) {
+    const dp = simplifyFeature(b.feature, tol);
+    b._simp = { tol, src: b.feature, cv, ...(cv ? curveGeometry(dp, tol) : { feature: dp, curveRings: null }), dpCount: countVertices(dp.geometry) };
+  }
+  return b._simp;
+}
+function boundaryFeature(b) { return boundarySimp(b).feature; }
+function isoSimp(iso) {
   const tol = iso.simplify || 0;
   const feats = (iso.geojson && iso.geojson.features) || [];
-  if (!tol) return feats;
-  if (!iso._simp || iso._simp.tol !== tol || iso._simp.src !== iso.geojson) iso._simp = { tol, src: iso.geojson, features: feats.map(f => simplifyFeature(f, tol)) };
-  return iso._simp.features;
+  if (!tol) return feats.map(f => ({ feature: f, curveRings: null }));
+  const cv = curvesEnabled();
+  if (!iso._simp || iso._simp.tol !== tol || iso._simp.src !== iso.geojson || iso._simp.cv !== cv) {
+    iso._simp = { tol, src: iso.geojson, cv, items: feats.map(f => { const dp = simplifyFeature(f, tol); return { ...(cv ? curveGeometry(dp, tol) : { feature: dp, curveRings: null }), dpCount: countVertices(dp.geometry) }; }) };
+  }
+  return iso._simp.items;
 }
+// Isocrona: array di Feature semplificate
+function isoFeatures(iso) { return isoSimp(iso).map(it => it.feature); }
+function curveNodeCount(rings) { return (rings || []).reduce((n, segs) => n + (segs ? segs.length : 0), 0); }
 function shapeVertexInfo(kind, shape) {
-  if (kind === 'boundary') return { orig: countVertices(shape.feature.geometry), now: countVertices(boundaryFeature(shape).geometry) };
+  if (kind === 'boundary') {
+    const s = boundarySimp(shape);
+    return { orig: countVertices(shape.feature.geometry), now: shape.simplify ? s.dpCount : countVertices(shape.feature.geometry), nodes: curveNodeCount(s.curveRings), curved: !!(s.curveRings && s.curveRings.some(Boolean)) };
+  }
   const o = ((shape.geojson && shape.geojson.features) || []).reduce((n, f) => n + countVertices(f.geometry), 0);
-  const s = isoFeatures(shape).reduce((n, f) => n + countVertices(f.geometry), 0);
-  return { orig: o, now: s };
+  const items = isoSimp(shape);
+  return { orig: o, now: shape.simplify ? items.reduce((n, it) => n + it.dpCount, 0) : o, nodes: items.reduce((n, it) => n + curveNodeCount(it.curveRings), 0), curved: items.some(it => it.curveRings && it.curveRings.some(Boolean)) };
+}
+function simplifyInfoText(shape, vi) {
+  if (!shape.simplify) return `originale · ${vi.orig.toLocaleString('it-IT')} vertici`;
+  return vi.curved
+    ? `${simplifyLabel(shape.simplify)} · ${vi.nodes.toLocaleString('it-IT')} nodi curva (da ${vi.orig.toLocaleString('it-IT')} vertici)`
+    : `${simplifyLabel(shape.simplify)} · ${vi.now.toLocaleString('it-IT')}/${vi.orig.toLocaleString('it-IT')} vertici`;
 }
 const SIMPLIFY_STEPS = [0, 5, 10, 20, 50, 100, 200, 500, 1000, 2000];   // metri, scala non lineare per lo slider
 function simplifyLabel(m) { return m ? (m >= 1000 ? (m / 1000) + ' km' : m + ' m') : 'originale'; }
@@ -8091,7 +8170,7 @@ function simplifyRowHtml(kind, shape, uid) {
   return `<div class="sp-row" style="margin-top:4px;">
       <label title="Semplifica la curva (Douglas-Peucker): meno vertici, file più leggeri. La geometria originale resta salvata.">Semplifica</label>
       <input type="range" min="0" max="${SIMPLIFY_STEPS.length - 1}" step="1" value="${idx}" data-simplify="${uid}" style="flex:1;">
-      <span class="val" data-simplify-val="${uid}" style="width:auto; white-space:nowrap;">${simplifyLabel(shape.simplify || 0)} · ${vi.now.toLocaleString('it-IT')}${shape.simplify ? '/' + vi.orig.toLocaleString('it-IT') : ''} vertici</span>
+      <span class="val" data-simplify-val="${uid}" style="width:auto;">${simplifyInfoText(shape, vi)}</span>
     </div>`;
 }
 function bindSimplifyRow(root, kind, shape, uid, onChange) {
@@ -8101,9 +8180,17 @@ function bindSimplifyRow(root, kind, shape, uid, onChange) {
   inp.addEventListener('input', () => {
     shape.simplify = SIMPLIFY_STEPS[parseInt(inp.value, 10)] || 0;
     const vi = shapeVertexInfo(kind, shape);
-    if (val) val.textContent = `${simplifyLabel(shape.simplify)} · ${vi.now.toLocaleString('it-IT')}${shape.simplify ? '/' + vi.orig.toLocaleString('it-IT') : ''} vertici`;
+    if (val) val.textContent = simplifyInfoText(shape, vi);
     if (onChange) onChange();
   });
+}
+
+// curveRings di curveGeometry: per Polygon [ring...], per MultiPolygon [[ring...]...] → lista piatta
+function flatCurveRings(rings) {
+  if (!rings) return null;
+  const out = [];
+  for (const r of rings) { if (Array.isArray(r) && r.length && Array.isArray(r[0]) && Array.isArray(r[0][0]) && Array.isArray(r[0][0][0])) out.push(...r); else out.push(r); }
+  return out.some(Boolean) ? out : null;
 }
 
 function shapeToFeature(kind, shape) {
@@ -9296,6 +9383,7 @@ function initFrameUI() {
   document.getElementById('frameClear').addEventListener('click', () => setFrame(null));
   document.getElementById('frameFit').addEventListener('click', () => { if (STATE.frame) setFrame(STATE.frame, { fit: true }); else toast('Nessun riquadro.', 'warn'); });
   document.getElementById('frameMask').addEventListener('change', redrawFrame);
+  document.getElementById('exportCurves').addEventListener('change', () => { redrawBoundaries(); redrawSpotlight(); redrawIsochrones(); renderBoundaryStyleList(); renderIsoList(); });
   document.getElementById('exportPxScaleFit').addEventListener('click', () => {
     if (!STATE.map) return;
     const B = legendBox();   // riquadro (o vista) sullo schermo, in px
@@ -10039,6 +10127,7 @@ function buildExportSvg(V, baseDataUrl, opts) {
       if ((b.fillOpacity || 0) > 0) {
         svg += '    ' + geometryToSvgPath(boundaryFeature(b).geometry, project, {
           curveErr: b.simplify ? b.simplify / V.metersPerUnit : 0.75,
+          curveRings: flatCurveRings(boundarySimp(b).curveRings),
           fill: b.color,
           fillOpacity: b.fillOpacity,
           stroke: 'none',
@@ -10046,6 +10135,7 @@ function buildExportSvg(V, baseDataUrl, opts) {
       }
       svg += '    ' + geometryToSvgPath(boundaryFeature(b).geometry, project, {
         curveErr: b.simplify ? b.simplify / V.metersPerUnit : 0.75,
+        curveRings: flatCurveRings(boundarySimp(b).curveRings),
         fill: 'none',
         stroke: b.strokeColor,
         strokeWidth: strokeUnits(b, V),
@@ -10064,9 +10154,11 @@ function buildExportSvg(V, baseDataUrl, opts) {
     svg += `<g id="isochrones" inkscape:label="Isocrone">\n`;
     for (const iso of visIsos) {
       svg += `  <g id="iso-${idOf(iso.name)}" inkscape:label="${escapeHtml(iso.name || 'Isocrona')}">\n`;
-      isoFeatures(iso).forEach((f, fi) => {
+      isoSimp(iso).forEach((it, fi) => {
+        const f = it.feature;
         svg += '    ' + geometryToSvgPath(f.geometry, project, {
           curveErr: iso.simplify ? iso.simplify / V.metersPerUnit : 0.75,
+          curveRings: flatCurveRings(it.curveRings),
           fill: iso.color,
           fillOpacity: iso.opacity,
           stroke: iso.color,
@@ -10209,13 +10301,24 @@ function geometryToSvgPath(geom, project, style) {
     for (const s of segs) d += ' C' + f(s[1][0]) + ',' + f(s[1][1]) + ' ' + f(s[2][0]) + ',' + f(s[2][1]) + ' ' + f(s[3][0]) + ',' + f(s[3][1]);
     return d + ' Z';
   };
+  // Curve già adattate in coordinate geografiche (forme semplificate): stessi
+  // punti di controllo dello schermo, proiettati. Allineate agli anelli della geometria.
+  let ringIdx = 0;
+  const storedRing = (ring) => {
+    const segs = style.curveRings ? style.curveRings[ringIdx++] : null;
+    if (!segs) return polylineRing(ring);
+    const P = c => { const p = project(c[0], c[1]); return (Math.round(p.x * 100) / 100) + ',' + (Math.round(p.y * 100) / 100); };
+    let d = 'M' + P(segs[0][0]);
+    for (const s of segs) d += ' C' + P(s[1]) + ' ' + P(s[2]) + ' ' + P(s[3]);
+    return d + ' Z';
+  };
   const useCurves = style.curves != null ? style.curves : (document.getElementById('exportCurves') || {}).checked;
-  const ringToPath = useCurves ? bezierRing : polylineRing;
+  const ringToPath = style.curveRings ? storedRing : (useCurves ? bezierRing : polylineRing);
   let d = '';
   if (geom.type === 'Polygon') {
     d = geom.coordinates.map(ringToPath).join(' ');
   } else if (geom.type === 'MultiPolygon') {
-    d = geom.coordinates.map(poly => poly.map(ringToPath).join(' ')).join(' ');
+    d = geom.coordinates.map(poly => poly.map(ringToPath).join(' ')).join(' ');   // ringIdx segue l'ordine degli anelli
   }
   const ss = STATE.strokeStyle || {};
   const capJoin = ` stroke-linejoin="${ss.join || 'round'}" stroke-linecap="${ss.cap || 'round'}"`;
