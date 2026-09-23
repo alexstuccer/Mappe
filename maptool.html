@@ -1539,7 +1539,7 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
 
   <!-- ============== TOPBAR ============== -->
   <div class="topbar">
-    <div class="topbar-title">Map Tool <span>v0.12</span></div>
+    <div class="topbar-title">Map Tool <span>v0.13</span></div>
     <div style="display:flex; gap:8px; margin-left:6px;">
       <button class="btn small primary" id="btnTopbarSave" title="Salva tutto il progetto in un file JSON">💾 Salva</button>
       <button class="btn small" id="btnTopbarOpen" title="Apri un progetto salvato (JSON) — sostituisce il lavoro corrente">📂 Apri</button>
@@ -1861,6 +1861,14 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
         <label class="field">
           <span class="label">Larghezza SVG (unità)</span>
           <input type="number" id="exportWidth" value="1400" min="300" max="8000" step="50">
+        </label>
+        <label class="field">
+          <span class="label">Icone e spessori in px → unità SVG (fattore)</span>
+          <div style="display: flex; gap: 6px; align-items: center;">
+            <input type="number" id="exportPxScale" value="1" min="0.1" max="10" step="0.05" style="flex: 1; font-family: var(--font-mono);">
+            <button class="btn small" id="exportPxScaleFit" title="Larghezza SVG ÷ larghezza del riquadro sullo schermo: le icone nel file avranno la proporzione che vedi ora">Come a schermo</button>
+          </div>
+          <div class="help">1 = un pixel a schermo vale un'unità SVG (indipendente dalla finestra). "Come a schermo" calcola il fattore dal riquadro corrente. I metri non sono toccati.</div>
         </label>
         <label class="field" style="margin-bottom: 4px;">
           <span class="label" style="display: flex; align-items: center; gap: 6px;">
@@ -8504,13 +8512,19 @@ function exportView() {
   const H = r2(k * (MERC.y(b.s) - MERC.y(b.n)));
   const latC = (b.n + b.s) / 2;
   const metersPerUnit = (MERC.x(b.e) - MERC.x(b.w)) * 40075016.686 * Math.cos(latC * Math.PI / 180) / W;
-  return { W, H, k, ox: k * MERC.x(b.w), oy: k * MERC.y(b.n), b, metersPerUnit, fromFrame };
+  return { W, H, k, ox: k * MERC.x(b.w), oy: k * MERC.y(b.n), b, metersPerUnit, fromFrame, pxScale: exportPxScale() };
 }
 const projectView = V => (lng, lat) => ({ x: r2(V.k * MERC.x(lng) - V.ox), y: r2(V.k * MERC.y(lat) - V.oy) });
 // Spessore in unità SVG: i px valgono come unità (convenzione cartogramma), i metri sono esatti
+// Fattore px → unità SVG per icone e spessori in px (i metri sono esatti comunque)
+function exportPxScale() {
+  const el = document.getElementById('exportPxScale');
+  const v = parseFloat(el && el.value);
+  return Number.isFinite(v) && v > 0 ? v : 1;
+}
 function strokeUnits(owner, V) {
   const w = owner.strokeWidth != null ? owner.strokeWidth : 1.5;
-  return owner.strokeWidthMode === 'm' ? r2(w / V.metersPerUnit) : w;
+  return owner.strokeWidthMode === 'm' ? r2(w / V.metersPerUnit) : r2(w * (V.pxScale || 1));
 }
 function waitIdle(map, ms) {
   return new Promise(res => {
@@ -8529,6 +8543,13 @@ function initFrameUI() {
   document.getElementById('frameClear').addEventListener('click', () => setFrame(null));
   document.getElementById('frameFit').addEventListener('click', () => { if (STATE.frame) setFrame(STATE.frame, { fit: true }); else toast('Nessun riquadro.', 'warn'); });
   document.getElementById('frameMask').addEventListener('change', redrawFrame);
+  document.getElementById('exportPxScaleFit').addEventListener('click', () => {
+    if (!STATE.map) return;
+    const B = legendBox();   // riquadro (o vista) sullo schermo, in px
+    const f = Math.round((exportWidth() / B.w) * 100) / 100;
+    document.getElementById('exportPxScale').value = f;
+    toast(`Fattore ${f}: ${exportWidth()} unità / ${Math.round(B.w)} px di riquadro a schermo`, 'ok', 4000);
+  });
   const box = document.getElementById('frameBox');
   box.addEventListener('change', () => {
     const t = box.value.trim();
@@ -8779,10 +8800,12 @@ function legendSvg(V) {
     const it = e.it, ref = e.ref, cy = yy + LEGEND_ROW / 2;
     if (it.kind === 'layer') {
       const inner = extractSvgInner(normalizeSvgSize(ref.icon || defaultMarkerSvg(ref.color), ref.iconSize || 32));
-      const iw = inner.width || 24, ih = inner.height || 32;
-      const s = Math.min(LEGEND_SW / ih, LEGEND_SW / iw), uw = r2(iw * s), uh = r2(ih * s);
+      const vbw = inner.vb ? inner.vb.w : (inner.width || 24), vbh = inner.vb ? inner.vb.h : (inner.height || 32);
+      const s = Math.min(LEGEND_SW / vbh, LEGEND_SW / vbw), uw = vbw * s, uh = vbh * s;   // scala dalle coordinate native del simbolo
       const sym = layerSymbolId(ref);
-      o += `  <use href="#${sym}" xlink:href="#${sym}" x="${r2(LEGEND_PAD + (LEGEND_SW - uw) / 2)}" y="${r2(cy - uh / 2)}" width="${uw}" height="${uh}"/>\n`;
+      let tr = `translate(${r2(LEGEND_PAD + (LEGEND_SW - uw) / 2)} ${r2(cy - uh / 2)}) scale(${Math.round(s * 1000) / 1000})`;
+      if (inner.vb && (inner.vb.minX || inner.vb.minY)) tr += ` translate(${r2(-inner.vb.minX)} ${r2(-inner.vb.minY)})`;
+      o += `  <use href="#${sym}" xlink:href="#${sym}" transform="${tr}"/>\n`;
     } else if (it.kind === 'iso') {
       o += `  <rect x="${LEGEND_PAD}" y="${r2(cy - LEGEND_SW / 2)}" width="${LEGEND_SW}" height="${LEGEND_SW}" fill="${ref.color}" fill-opacity="${ref.opacity != null ? ref.opacity : 0.35}" stroke="${ref.color}" stroke-width="1"/>\n`;
     } else if (it.kind === 'boundary') {
@@ -9223,19 +9246,27 @@ function buildExportSvg(V, baseDataUrl, opts) {
       const normalized = normalizeSvgSize(layer.icon || defaultMarkerSvg(layer.color), layer.iconSize || 32);
       const inner = extractSvgInner(normalized);
       const iw = inner.width || 24, ih = inner.height || 32;
-      const vb = inner.vb ? `${inner.vb.minX} ${inner.vb.minY} ${inner.vb.w} ${inner.vb.h}` : `0 0 ${iw} ${ih}`;
       const symId = layerSymbolId(layer);
+      // Il simbolo NON ha viewBox: Affinity ignora la scala del viewBox sui <use>,
+      // Inkscape/Illustrator/browser la applicano. Con la scala nel transform del
+      // <use> il risultato è identico ovunque. (vb → px dell'icona → unità SVG)
+      const px = V.pxScale || 1;
+      const uw = r2(iw * px), uh = r2(ih * px);
+      const useTransform = (x, y) => {
+        const t = `translate(${r2(x)} ${r2(y)}) scale(${r2((ih * px) / (inner.vb ? inner.vb.h : ih) * 1000) / 1000})`;
+        return inner.vb && (inner.vb.minX || inner.vb.minY) ? `${t} translate(${r2(-inner.vb.minX)} ${r2(-inner.vb.minY)})` : t;
+      };
       let layerSvg = '', mc = 0;
       for (const pt of (layer.visible ? layer.points : [])) {
         if (pt.pending || !Number.isFinite(pt.lat) || !Number.isFinite(pt.lng)) continue;
         const p = project(pt.lng, pt.lat);
         if (!inCrop(p.x, p.y)) continue;
-        const x = r2(p.x - iw / 2), y = r2(p.y - ih);   // ancoraggio in basso al centro, come a schermo
-        layerSvg += `    <use href="#${symId}" xlink:href="#${symId}" x="${x}" y="${y}" width="${iw}" height="${ih}" data-label="${escapeHtml(pt.label || pt.address || '')}"/>\n`;
+        // ancoraggio in basso al centro, come a schermo
+        layerSvg += `    <use href="#${symId}" xlink:href="#${symId}" transform="${useTransform(p.x - uw / 2, p.y - uh)}" data-label="${escapeHtml(pt.label || pt.address || '')}"/>\n`;
         mc++;
       }
       if (mc > 0 || legendLayers.has(layer.id)) {
-        symbolDefs += `<symbol id="${symId}" viewBox="${vb}" width="${iw}" height="${ih}" overflow="visible">${namespaceSvgBody(inner.body, symId)}</symbol>\n`;
+        symbolDefs += `<symbol id="${symId}" overflow="visible">${namespaceSvgBody(inner.body, symId)}</symbol>\n`;
       }
       if (mc > 0) {
         svg += `  <g id="layer-${idOf(layer.name)}" inkscape:label="${escapeHtml(layer.name || 'Layer')}">\n${layerSvg}  </g>\n`;
@@ -10686,6 +10717,7 @@ function buildProjectJson() {
       exportEmbedBg: document.getElementById('exportEmbedBg').checked,
       exportAttr: document.getElementById('exportAttr').checked,
       exportGray: document.getElementById('exportGray').checked,
+      exportPxScale: exportPxScale(),
     },
     layers, boundaries, isochrones,
   };
@@ -11060,6 +11092,7 @@ function applyProjectJson(project) {
   legendSync();
   if (s.exportScale) document.getElementById('exportScale').value = s.exportScale;
   for (const k of ['exportEmbedBg', 'exportAttr', 'exportGray']) if (s[k] != null) document.getElementById(k).checked = !!s[k];
+  if (s.exportPxScale) document.getElementById('exportPxScale').value = s.exportPxScale;
   if (s.strokeStyle) STATE.strokeStyle = { ...s.strokeStyle };
   if (s.mapLanguage) STATE.mapLanguage = s.mapLanguage;
 
