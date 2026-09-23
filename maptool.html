@@ -2184,7 +2184,7 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
 
   <!-- ============== TOPBAR ============== -->
   <div class="topbar">
-    <div class="topbar-title">Map Tool <span>v0.19</span></div>
+    <div class="topbar-title">Map Tool <span>v0.22</span></div>
     <div style="display:flex; gap:8px; margin-left:6px;">
       <button class="btn small primary" id="btnTopbarSave" title="Salva tutto il progetto in un file JSON">💾 Salva</button>
       <button class="btn small" id="btnTopbarOpen" title="Apri un progetto salvato (JSON) — sostituisce il lavoro corrente">📂 Apri</button>
@@ -2265,7 +2265,7 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
           <input type="file" id="boundaryFile" accept=".geojson,.json,.kml,.kmz,application/geo+json,application/json,application/vnd.google-earth.kml+xml,application/vnd.google-earth.kmz" style="display:none;">
           <button class="btn full" onclick="document.getElementById('boundaryFile').click()">Scegli file GeoJSON, KML o KMZ</button>
         </div>
-        <div class="help">GeoJSON multi-feature: si apre un selettore ad albero per scegliere quali feature importare (singolarmente o per ambito). KML/KMZ: ogni poligono diventa un confine.</div>
+        <div class="help">GeoJSON multi-feature: si apre un selettore ad albero per scegliere quali feature importare (singolarmente o per ambito). KML/KMZ: ogni poligono diventa un confine. Con la matita accanto a ogni confine caricato regoli stile e semplificazione (anche cliccando il confine sulla mappa).</div>
       </div>
 
       <div class="section">
@@ -2592,6 +2592,19 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
         <label class="field" style="margin-bottom: 0;">
           <span class="label" style="display: flex; align-items: center; gap: 6px;"><input type="checkbox" id="exportCurves" checked> Curve di Bézier sulle forme semplificate (a schermo e nell'SVG)</span>
           <div class="help">Le forme con "Semplifica" attivo diventano curve lisce con pochi nodi, entro la tolleranza scelta: a schermo la vedi già così, e nel file sono comandi C con gli stessi punti di controllo. Le forme non semplificate escono nel file come curve fini (0,75 unità); spegni per i vertici esatti.</div>
+        </label>
+        <label class="field" style="margin-bottom: 0;">
+          <span class="label">Arrotonda gli angoli prima delle curve (raggio, m)</span>
+          <select id="exportCornerR">
+            <option value="0">0 — nessuno (segue gli spigoli)</option>
+            <option value="20">20 m</option>
+            <option value="50">50 m</option>
+            <option value="100" selected>100 m</option>
+            <option value="200">200 m</option>
+            <option value="500">500 m</option>
+            <option value="1000">1 km</option>
+          </select>
+          <div class="help">Ogni spigolo viene smussato con questo raggio (mai oltre metà del lato), poi le curve ci passano lisce. È ciò che rende "tonde" isocrone e confini a griglia; la tolleranza da sola conserva gli spigoli più grandi di lei. Curve e raggio sono impostazioni generali: ogni confine o isocrona può ignorarle dai propri controlli accanto a "Semplifica".</div>
         </label>
       </div>
 
@@ -8075,22 +8088,53 @@ function simplifyFeature(feature, meters) {
    sola. Da quelle stesse curve escono la spezzata fitta disegnata a schermo
    (curva appiattita a passi ≤ tolleranza/2, quindi liscia) e i comandi C dell'SVG:
    quello che vedi è quello che esporti. */
-function curvesEnabled() { const el = document.getElementById('exportCurves'); return el ? el.checked : true; }
+// Impostazioni globali (pannello Export) con possibilità di override per forma:
+// shape.curves = true/false (null = globale), shape.cornerR = metri (null = globale)
+function curvesEnabled(shape) {
+  if (shape && shape.curves != null) return !!shape.curves;
+  const el = document.getElementById('exportCurves'); return el ? el.checked : true;
+}
+function cornerRadiusM(shape) {
+  if (shape && shape.cornerR != null && Number.isFinite(+shape.cornerR)) return +shape.cornerR;
+  const el = document.getElementById('exportCornerR'); const v = parseFloat(el && el.value); return Number.isFinite(v) ? v : 100;
+}
+const CORNER_STEPS = [0, 20, 50, 100, 200, 500, 1000];
+// Smussa gli spigoli di un anello (coordinate locali in metri): ogni vertice è
+// sostituito da due punti sui lati adiacenti a distanza ≤ R (mai oltre metà lato),
+// così l'adattamento successivo ci passa con una curva. Angoli piatti restano tali.
+function roundCornersLocal(pts, R) {
+  const n = pts.length;
+  if (!(R > 0) || n < 4) return pts;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const p = pts[i], a = pts[(i - 1 + n) % n], b = pts[(i + 1) % n];
+    const la = Math.hypot(p[0] - a[0], p[1] - a[1]), lb = Math.hypot(b[0] - p[0], b[1] - p[1]);
+    if (la < 1e-6 || lb < 1e-6) { out.push(p); continue; }
+    // angolo tra i lati: sotto ~8° il vertice è quasi allineato, non serve smussare
+    const cosT = ((a[0] - p[0]) * (b[0] - p[0]) + (a[1] - p[1]) * (b[1] - p[1])) / (la * lb);
+    if (cosT < -0.99) { out.push(p); continue; }
+    const d = Math.min(R, la * 0.45, lb * 0.45);
+    out.push([p[0] + (a[0] - p[0]) / la * d, p[1] + (a[1] - p[1]) / la * d]);
+    out.push([p[0] + (b[0] - p[0]) / lb * d, p[1] + (b[1] - p[1]) / lb * d]);
+  }
+  return out;
+}
 function ringLocalFrame(ring) {
   const lat0 = ring[0][1], lon0 = ring[0][0], kx = Math.cos(lat0 * Math.PI / 180) * 111320, ky = 111320;
   return { toLocal: c => [(c[0] - lon0) * kx, (c[1] - lat0) * ky], toGeo: p => [p[0] / kx + lon0, p[1] / ky + lat0] };
 }
 // Segmenti [[p0,c1,c2,p1],...] in lon/lat per un anello, oppure null se non adattabile
-function fitRingCurves(ring, tolM) {
+function fitRingCurves(ring, tolM, cornerR) {
   if (typeof fitCurve !== 'function' || !ring || ring.length < 4) return null;
   const F = ringLocalFrame(ring);
   const pts = [];
   for (const c of ring) { const p = F.toLocal(c); if (!pts.length || Math.hypot(p[0] - pts[pts.length - 1][0], p[1] - pts[pts.length - 1][1]) > 1e-3) pts.push(p); }
   if (pts.length > 1 && Math.hypot(pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]) < 1e-3) pts.pop();
   if (pts.length < 4 || pts.length > 8000) return null;
-  pts.push(pts[0]);
+  const rounded = roundCornersLocal(pts, cornerR != null ? cornerR : cornerRadiusM());
+  rounded.push(rounded[0]);
   let segs;
-  try { segs = fitCurve(pts, Math.pow(Math.max(tolM, 1), 2)); } catch (e) { return null; }
+  try { segs = fitCurve(rounded, Math.pow(Math.max(tolM, 1), 2)); } catch (e) { return null; }
   if (!segs || !segs.length) return null;
   return segs.map(s => s.map(F.toGeo));
 }
@@ -8110,10 +8154,10 @@ function flattenCurves(segs, tolM) {
   return out;
 }
 // Geometria semplificata → { feature (appiattita), curveRings (allineati agli anelli, null = spezzata) }
-function curveGeometry(feature, tolM) {
+function curveGeometry(feature, tolM, cornerR) {
   const g = feature.geometry;
   const rings = [];
-  const conv = ring => { const segs = fitRingCurves(ring, tolM); rings.push(segs); return segs ? flattenCurves(segs, tolM) : ring; };
+  const conv = ring => { const segs = fitRingCurves(ring, tolM, cornerR); rings.push(segs); return segs ? flattenCurves(segs, tolM) : ring; };
   let coords;
   if (g.type === 'Polygon') coords = g.coordinates.map(conv);
   else if (g.type === 'MultiPolygon') coords = g.coordinates.map(poly => poly.map(conv));
@@ -8125,10 +8169,10 @@ function curveGeometry(feature, tolM) {
 function boundarySimp(b) {
   const tol = b.simplify || 0;
   if (!tol) return { feature: b.feature, curveRings: null };
-  const cv = curvesEnabled();
-  if (!b._simp || b._simp.tol !== tol || b._simp.src !== b.feature || b._simp.cv !== cv) {
+  const cv = curvesEnabled(b), cr = cornerRadiusM(b);
+  if (!b._simp || b._simp.tol !== tol || b._simp.src !== b.feature || b._simp.cv !== cv || b._simp.cr !== cr) {
     const dp = simplifyFeature(b.feature, tol);
-    b._simp = { tol, src: b.feature, cv, ...(cv ? curveGeometry(dp, tol) : { feature: dp, curveRings: null }), dpCount: countVertices(dp.geometry) };
+    b._simp = { tol, src: b.feature, cv, cr, ...(cv ? curveGeometry(dp, tol, cr) : { feature: dp, curveRings: null }), dpCount: countVertices(dp.geometry) };
   }
   return b._simp;
 }
@@ -8137,9 +8181,9 @@ function isoSimp(iso) {
   const tol = iso.simplify || 0;
   const feats = (iso.geojson && iso.geojson.features) || [];
   if (!tol) return feats.map(f => ({ feature: f, curveRings: null }));
-  const cv = curvesEnabled();
-  if (!iso._simp || iso._simp.tol !== tol || iso._simp.src !== iso.geojson || iso._simp.cv !== cv) {
-    iso._simp = { tol, src: iso.geojson, cv, items: feats.map(f => { const dp = simplifyFeature(f, tol); return { ...(cv ? curveGeometry(dp, tol) : { feature: dp, curveRings: null }), dpCount: countVertices(dp.geometry) }; }) };
+  const cv = curvesEnabled(iso), cr = cornerRadiusM(iso);
+  if (!iso._simp || iso._simp.tol !== tol || iso._simp.src !== iso.geojson || iso._simp.cv !== cv || iso._simp.cr !== cr) {
+    iso._simp = { tol, src: iso.geojson, cv, cr, items: feats.map(f => { const dp = simplifyFeature(f, tol); return { ...(cv ? curveGeometry(dp, tol, cr) : { feature: dp, curveRings: null }), dpCount: countVertices(dp.geometry) }; }) };
   }
   return iso._simp.items;
 }
@@ -8171,18 +8215,39 @@ function simplifyRowHtml(kind, shape, uid) {
       <label title="Semplifica la curva (Douglas-Peucker): meno vertici, file più leggeri. La geometria originale resta salvata.">Semplifica</label>
       <input type="range" min="0" max="${SIMPLIFY_STEPS.length - 1}" step="1" value="${idx}" data-simplify="${uid}" style="flex:1;">
       <span class="val" data-simplify-val="${uid}" style="width:auto;">${simplifyInfoText(shape, vi)}</span>
+    </div>
+    <div class="sp-row" data-simplify-opts="${uid}" style="margin-top:2px; ${shape.simplify ? '' : 'display:none;'}">
+      <label style="width:auto; display:flex; align-items:center; gap:5px;" title="Curve di Bézier per questa forma (vuoto = impostazione generale del pannello Export)">
+        <select data-simplify-curves="${uid}" style="font-size:11px; padding:2px 5px;">
+          <option value="" ${shape.curves == null ? 'selected' : ''}>Curve: generale (${curvesEnabled() ? 'sì' : 'no'})</option>
+          <option value="1" ${shape.curves === true ? 'selected' : ''}>Curve: sì</option>
+          <option value="0" ${shape.curves === false ? 'selected' : ''}>Curve: no</option>
+        </select>
+      </label>
+      <label style="width:auto; display:flex; align-items:center; gap:5px;" title="Raggio di arrotondamento degli angoli per questa forma">
+        <select data-simplify-corner="${uid}" style="font-size:11px; padding:2px 5px;">
+          <option value="" ${shape.cornerR == null ? 'selected' : ''}>Angoli: generale (${simplifyLabel(cornerRadiusM())})</option>
+          ${CORNER_STEPS.map(r => `<option value="${r}" ${shape.cornerR != null && +shape.cornerR === r ? 'selected' : ''}>Angoli: ${r ? simplifyLabel(r) : 'nessun arrotondamento'}</option>`).join('')}
+        </select>
+      </label>
     </div>`;
 }
 function bindSimplifyRow(root, kind, shape, uid, onChange) {
   const inp = root.querySelector(`[data-simplify="${uid}"]`);
   const val = root.querySelector(`[data-simplify-val="${uid}"]`);
   if (!inp) return;
+  const refreshVal = () => { const vi = shapeVertexInfo(kind, shape); if (val) val.textContent = simplifyInfoText(shape, vi); };
+  const opts = root.querySelector(`[data-simplify-opts="${uid}"]`);
   inp.addEventListener('input', () => {
     shape.simplify = SIMPLIFY_STEPS[parseInt(inp.value, 10)] || 0;
-    const vi = shapeVertexInfo(kind, shape);
-    if (val) val.textContent = simplifyInfoText(shape, vi);
+    if (opts) opts.style.display = shape.simplify ? '' : 'none';
+    refreshVal();
     if (onChange) onChange();
   });
+  const cvSel = root.querySelector(`[data-simplify-curves="${uid}"]`);
+  if (cvSel) cvSel.addEventListener('change', () => { shape.curves = cvSel.value === '' ? null : cvSel.value === '1'; refreshVal(); if (onChange) onChange(); });
+  const crSel = root.querySelector(`[data-simplify-corner="${uid}"]`);
+  if (crSel) crSel.addEventListener('change', () => { shape.cornerR = crSel.value === '' ? null : parseFloat(crSel.value); refreshVal(); if (onChange) onChange(); });
 }
 
 // curveRings di curveGeometry: per Polygon [ring...], per MultiPolygon [[ring...]...] → lista piatta
@@ -8575,14 +8640,24 @@ function renderBoundaryList() {
     const isSel = STATE.boolSelection.has(b.id);
     li.innerHTML = `
       <input type="checkbox" class="item-bool-check" ${isSel ? 'checked' : ''} title="Seleziona per operazioni booleane">
-      <div class="item-swatch" style="background: ${b.fillOpacity > 0 ? b.color : 'transparent'}; border: 2px solid ${b.strokeColor};"></div>
+      <div class="item-swatch" data-swatch="${b.id}" style="background: ${b.fillOpacity > 0 ? b.color : 'transparent'}; border: 2px solid ${b.strokeColor};"></div>
       <div class="item-name" title="${escapeHtml(b.name)}">${escapeHtml(b.name)}</div>
       <div class="item-actions">
         <button class="icon-btn" data-act="zoom" title="Zoom">${zoomIcon()}</button>
+        <button class="icon-btn" data-act="style" title="Stile e semplificazione">${editIcon()}</button>
         <button class="icon-btn" data-act="vis" title="Mostra/nascondi">${b.visible ? eyeIcon() : eyeOffIcon()}</button>
         <button class="icon-btn danger" data-act="del" title="Elimina">${trashIcon()}</button>
       </div>
+      <div class="iso-style-row" data-boundary-style="${b.id}" style="display:${b._styleOpen ? 'block' : 'none'}; flex-basis:100%; margin-top:8px; padding-top:8px; border-top:1px solid var(--border-subtle);">
+        ${boundaryStyleCardHtml(b, false)}
+      </div>
     `;
+    bindBoundaryStyleCard(li.querySelector('[data-boundary-style]'), b);
+    li.querySelector('[data-act=style]').addEventListener('click', () => {
+      const row = li.querySelector('[data-boundary-style]');
+      b._styleOpen = row.style.display === 'none';
+      row.style.display = b._styleOpen ? 'block' : 'none';
+    });
     li.querySelector('.item-bool-check').addEventListener('change', e => {
       if (e.target.checked) STATE.boolSelection.add(b.id);
       else STATE.boolSelection.delete(b.id);
@@ -8771,16 +8846,11 @@ function updateBoundaryLineDashes() {
   applyGlobalStrokeStyle();
 }
 
-function renderBoundaryStyleList() {
-  const c = document.getElementById('boundaryStyleList');
-  const empty = document.getElementById('boundaryStyleEmpty');
-  c.innerHTML = '';
-  empty.style.display = STATE.boundaries.length ? 'none' : 'block';
-  for (const b of STATE.boundaries) {
-    const div = document.createElement('div');
-    div.style.cssText = 'background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: 4px; padding: 10px; margin-bottom: 8px;';
-    div.innerHTML = `
-      <div style="font-size: 12px; color: var(--text-primary); font-weight: 500; margin-bottom: 8px;">${escapeHtml(b.name)}</div>
+// Controlli di stile di un confine (bordo, riempimento, tratteggio, allineamento,
+// semplificazione): usati nella scheda Stile e, a richiesta, nella scheda Confini.
+function boundaryStyleCardHtml(b, withTitle) {
+  return `
+      ${withTitle ? `<div style="font-size: 12px; color: var(--text-primary); font-weight: 500; margin-bottom: 8px;">${escapeHtml(b.name)}</div>` : ''}
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
         <label class="field" style="margin-bottom: 4px;">
           <span class="label">Bordo</span>
@@ -8817,10 +8887,10 @@ function renderBoundaryStyleList() {
       </div>
       ${simplifyRowHtml('boundary', b, 'bs_' + b.id)}
     `;
-    bindSimplifyRow(div, 'boundary', b, 'bs_' + b.id, () => { redrawBoundaries(); redrawSpotlight(); });
-    c.appendChild(div);
-  }
-  c.querySelectorAll('[data-bid]').forEach(inp => {
+}
+function bindBoundaryStyleCard(container, b) {
+  bindSimplifyRow(container, 'boundary', b, 'bs_' + b.id, () => { redrawBoundaries(); redrawSpotlight(); syncBoundaryCards(container, b); });
+  container.querySelectorAll('[data-bid]').forEach(inp => {
     const evt = inp.tagName === 'SELECT' ? 'change' : 'input';
     inp.addEventListener(evt, () => {
       const b = STATE.boundaries.find(x => x.id === inp.dataset.bid);
@@ -8843,12 +8913,36 @@ function renderBoundaryStyleList() {
         b.strokeWidthMode = v;
         redrawBoundaries();
         renderBoundaryStyleList(); // refresh input limits + converted value
+        renderBoundaryList();
         return;
       }
       b[prop] = v;
       redrawBoundaries();
+      syncBoundaryCards(container, b);
     });
   });
+}
+// Le due schede (Stile e Confini) mostrano gli stessi controlli: dopo una modifica
+// si aggiorna il campione e si rigenera SOLO la scheda non in uso (rigenerare quella
+// in uso distruggerebbe lo slider che si sta trascinando).
+function syncBoundaryCards(container, b) {
+  const sw = document.querySelector(`#boundaryList [data-swatch="${b.id}"]`);
+  if (sw) { sw.style.background = (b.fillOpacity || 0) > 0 ? b.color : 'transparent'; sw.style.border = `2px solid ${b.strokeColor}`; }
+  if (container && container.closest && container.closest('#boundaryStyleList')) renderBoundaryList();
+  else renderBoundaryStyleList();
+}
+function renderBoundaryStyleList() {
+  const c = document.getElementById('boundaryStyleList');
+  const empty = document.getElementById('boundaryStyleEmpty');
+  c.innerHTML = '';
+  empty.style.display = STATE.boundaries.length ? 'none' : 'block';
+  for (const b of STATE.boundaries) {
+    const div = document.createElement('div');
+    div.style.cssText = 'background: var(--bg-elevated); border: 1px solid var(--border-subtle); border-radius: 4px; padding: 10px; margin-bottom: 8px;';
+    div.innerHTML = boundaryStyleCardHtml(b, true);
+    bindBoundaryStyleCard(div, b);
+    c.appendChild(div);
+  }
 }
 
 /* =============================================================================
@@ -9383,7 +9477,9 @@ function initFrameUI() {
   document.getElementById('frameClear').addEventListener('click', () => setFrame(null));
   document.getElementById('frameFit').addEventListener('click', () => { if (STATE.frame) setFrame(STATE.frame, { fit: true }); else toast('Nessun riquadro.', 'warn'); });
   document.getElementById('frameMask').addEventListener('change', redrawFrame);
-  document.getElementById('exportCurves').addEventListener('change', () => { redrawBoundaries(); redrawSpotlight(); redrawIsochrones(); renderBoundaryStyleList(); renderIsoList(); });
+  const recurve = () => { redrawBoundaries(); redrawSpotlight(); redrawIsochrones(); renderBoundaryStyleList(); renderIsoList(); };
+  document.getElementById('exportCurves').addEventListener('change', recurve);
+  document.getElementById('exportCornerR').addEventListener('change', recurve);
   document.getElementById('exportPxScaleFit').addEventListener('click', () => {
     if (!STATE.map) return;
     const B = legendBox();   // riquadro (o vista) sullo schermo, in px
@@ -11643,6 +11739,8 @@ function buildProjectJson() {
     dashed: !!b.dashed,
     strokeAlignment: b.strokeAlignment || 'center',
     simplify: b.simplify || 0,
+    curves: b.curves == null ? null : !!b.curves,
+    cornerR: b.cornerR == null ? null : b.cornerR,
     visible: b.visible !== false,
   }));
   const isochrones = STATE.isochrones.map(i => ({
@@ -11657,6 +11755,8 @@ function buildProjectJson() {
     provider: i.provider,
     strokeWidth: i.strokeWidth,
     simplify: i.simplify || 0,
+    curves: i.curves == null ? null : !!i.curves,
+    cornerR: i.cornerR == null ? null : i.cornerR,
     color: i.color,
     opacity: i.opacity,
     geojson: i.geojson,
@@ -11689,6 +11789,7 @@ function buildProjectJson() {
       exportGray: document.getElementById('exportGray').checked,
       exportPxScale: exportPxScale(),
       exportCurves: document.getElementById('exportCurves').checked,
+      exportCornerR: cornerRadiusM(),
     },
     layers, boundaries, isochrones,
   };
@@ -11923,6 +12024,8 @@ function applyMergeSelection(project, picks) {
         dashed: !!b.dashed,
         strokeAlignment: b.strokeAlignment || 'center',
         simplify: b.simplify || 0,
+        curves: b.curves == null ? null : !!b.curves,
+        cornerR: b.cornerR == null ? null : b.cornerR,
         visible: b.visible !== false,
       });
       addedB++;
@@ -11943,6 +12046,8 @@ function applyMergeSelection(project, picks) {
         provider: iso.provider,
         strokeWidth: iso.strokeWidth,
         simplify: iso.simplify || 0,
+        curves: iso.curves == null ? null : !!iso.curves,
+        cornerR: iso.cornerR == null ? null : iso.cornerR,
         color: iso.color || '#0d99ff',
         opacity: iso.opacity != null ? iso.opacity : 0.35,
         geojson: iso.geojson,
@@ -12029,6 +12134,8 @@ function applyProjectJson(project) {
       dashed: !!b.dashed,
       strokeAlignment: b.strokeAlignment || 'center',
       simplify: b.simplify || 0,
+      curves: b.curves == null ? null : !!b.curves,
+      cornerR: b.cornerR == null ? null : b.cornerR,
       visible: b.visible !== false,
     });
   }
@@ -12046,6 +12153,8 @@ function applyProjectJson(project) {
       provider: i.provider,
       strokeWidth: i.strokeWidth,
       simplify: i.simplify || 0,
+      curves: i.curves == null ? null : !!i.curves,
+      cornerR: i.cornerR == null ? null : i.cornerR,
       color: i.color || '#0d99ff',
       opacity: i.opacity != null ? i.opacity : 0.35,
       geojson: i.geojson,
@@ -12069,6 +12178,7 @@ function applyProjectJson(project) {
   for (const k of ['exportEmbedBg', 'exportAttr', 'exportGray']) if (s[k] != null) document.getElementById(k).checked = !!s[k];
   if (s.exportPxScale) document.getElementById('exportPxScale').value = s.exportPxScale;
   if (s.exportCurves != null) document.getElementById('exportCurves').checked = !!s.exportCurves;
+  if (s.exportCornerR != null) document.getElementById('exportCornerR').value = String(s.exportCornerR);
   if (s.strokeStyle) STATE.strokeStyle = { ...s.strokeStyle };
   if (s.mapLanguage) STATE.mapLanguage = s.mapLanguage;
 
