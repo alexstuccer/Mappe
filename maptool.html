@@ -44,6 +44,643 @@ window.addEventListener('error', function(e) {
 document.addEventListener('DOMContentLoaded', __renderErrorBox);
 </script>
 
+<!-- fit-curve: adattamento di curve di Bézier a una spezzata (Schneider, Graphics Gems 1990).
+     MIT License, (c) 2014 Volker Poplawski — https://github.com/soswow/fit-curves
+     Usato dall'export SVG per scrivere confini e isocrone come curve (opzione "curve di Bézier"). -->
+<script>
+(function (global, factory) {
+    if (typeof define === "function" && define.amd) {
+        define(["module"], factory);
+    } else if (typeof exports !== "undefined") {
+        factory(module);
+    } else {
+        var mod = {
+            exports: {}
+        };
+        factory(mod);
+        global.fitCurve = mod.exports;
+    }
+})(this, function (module) {
+    "use strict";
+
+    function _classCallCheck(instance, Constructor) {
+        if (!(instance instanceof Constructor)) {
+            throw new TypeError("Cannot call a class as a function");
+        }
+    }
+
+    /**
+     *  @preserve  JavaScript implementation of
+     *  Algorithm for Automatically Fitting Digitized Curves
+     *  by Philip J. Schneider
+     *  "Graphics Gems", Academic Press, 1990
+     *
+     *  The MIT License (MIT)
+     *
+     *  https://github.com/soswow/fit-curves
+     */
+
+    /**
+     * Fit one or more Bezier curves to a set of points.
+     *
+     * @param {Array<Array<Number>>} points - Array of digitized points, e.g. [[5,5],[5,50],[110,140],[210,160],[320,110]]
+     * @param {Number} maxError - Tolerance, squared error between points and fitted curve
+     * @returns {Array<Array<Array<Number>>>} Array of Bezier curves, where each element is [first-point, control-point-1, control-point-2, second-point] and points are [x, y]
+     */
+    function fitCurve(points, maxError, progressCallback) {
+        if (!Array.isArray(points)) {
+            throw new TypeError("First argument should be an array");
+        }
+        points.forEach(function (point) {
+            if (!Array.isArray(point) || point.some(function (item) {
+                return typeof item !== 'number';
+            }) || point.length !== points[0].length) {
+                throw Error("Each point should be an array of numbers. Each point should have the same amount of numbers.");
+            }
+        });
+
+        // Remove duplicate points
+        points = points.filter(function (point, i) {
+            return i === 0 || !point.every(function (val, j) {
+                return val === points[i - 1][j];
+            });
+        });
+
+        if (points.length < 2) {
+            return [];
+        }
+
+        var len = points.length;
+        var leftTangent = createTangent(points[1], points[0]);
+        var rightTangent = createTangent(points[len - 2], points[len - 1]);
+
+        return fitCubic(points, leftTangent, rightTangent, maxError, progressCallback);
+    }
+
+    /**
+     * Fit a Bezier curve to a (sub)set of digitized points.
+     * Your code should not call this function directly. Use {@link fitCurve} instead.
+     *
+     * @param {Array<Array<Number>>} points - Array of digitized points, e.g. [[5,5],[5,50],[110,140],[210,160],[320,110]]
+     * @param {Array<Number>} leftTangent - Unit tangent vector at start point
+     * @param {Array<Number>} rightTangent - Unit tangent vector at end point
+     * @param {Number} error - Tolerance, squared error between points and fitted curve
+     * @returns {Array<Array<Array<Number>>>} Array of Bezier curves, where each element is [first-point, control-point-1, control-point-2, second-point] and points are [x, y]
+     */
+    function fitCubic(points, leftTangent, rightTangent, error, progressCallback) {
+        var MaxIterations = 20; //Max times to try iterating (to find an acceptable curve)
+
+        var bezCurve, //Control points of fitted Bezier curve
+        u, //Parameter values for point
+        uPrime, //Improved parameter values
+        maxError, prevErr, //Maximum fitting error
+        splitPoint, prevSplit, //Point to split point set at if we need more than one curve
+        centerVector, toCenterTangent, fromCenterTangent, //Unit tangent vector(s) at splitPoint
+        beziers, //Array of fitted Bezier curves if we need more than one curve
+        dist, i;
+
+        //console.log('fitCubic, ', points.length);
+
+        //Use heuristic if region only has two points in it
+        if (points.length === 2) {
+            dist = maths.vectorLen(maths.subtract(points[0], points[1])) / 3.0;
+            bezCurve = [points[0], maths.addArrays(points[0], maths.mulItems(leftTangent, dist)), maths.addArrays(points[1], maths.mulItems(rightTangent, dist)), points[1]];
+            return [bezCurve];
+        }
+
+        //Parameterize points, and attempt to fit curve
+        u = chordLengthParameterize(points);
+
+        var _generateAndReport = generateAndReport(points, u, u, leftTangent, rightTangent, progressCallback);
+
+        bezCurve = _generateAndReport[0];
+        maxError = _generateAndReport[1];
+        splitPoint = _generateAndReport[2];
+
+
+        if (maxError === 0 || maxError < error) {
+            return [bezCurve];
+        }
+        //If error not too large, try some reparameterization and iteration
+        if (maxError < error * error) {
+
+            uPrime = u;
+            prevErr = maxError;
+            prevSplit = splitPoint;
+
+            for (i = 0; i < MaxIterations; i++) {
+
+                uPrime = reparameterize(bezCurve, points, uPrime);
+
+                var _generateAndReport2 = generateAndReport(points, u, uPrime, leftTangent, rightTangent, progressCallback);
+
+                bezCurve = _generateAndReport2[0];
+                maxError = _generateAndReport2[1];
+                splitPoint = _generateAndReport2[2];
+
+
+                if (maxError < error) {
+                    return [bezCurve];
+                }
+                //If the development of the fitted curve grinds to a halt,
+                //we abort this attempt (and try a shorter curve):
+                else if (splitPoint === prevSplit) {
+                        var errChange = maxError / prevErr;
+                        if (errChange > .9999 && errChange < 1.0001) {
+                            break;
+                        }
+                    }
+
+                prevErr = maxError;
+                prevSplit = splitPoint;
+            }
+        }
+
+        //Fitting failed -- split at max error point and fit recursively
+        beziers = [];
+
+        //To create a smooth transition from one curve segment to the next, we
+        //calculate the line between the points directly before and after the
+        //center, and use that as the tangent both to and from the center point.
+        centerVector = maths.subtract(points[splitPoint - 1], points[splitPoint + 1]);
+        //However, this won't work if they're the same point, because the line we
+        //want to use as a tangent would be 0. Instead, we calculate the line from
+        //that "double-point" to the center point, and use its tangent.
+        if (centerVector.every(function (val) {
+            return val === 0;
+        })) {
+            //[x,y] -> [-y,x]: http://stackoverflow.com/a/4780141/1869660
+            centerVector = maths.subtract(points[splitPoint - 1], points[splitPoint]);
+            var _ref = [-centerVector[1], centerVector[0]];
+            centerVector[0] = _ref[0];
+            centerVector[1] = _ref[1];
+        }
+        toCenterTangent = maths.normalize(centerVector);
+        //To and from need to point in opposite directions:
+        fromCenterTangent = maths.mulItems(toCenterTangent, -1);
+
+        /*
+        Note: An alternative to this "divide and conquer" recursion could be to always
+              let new curve segments start by trying to go all the way to the end,
+              instead of only to the end of the current subdivided polyline.
+              That might let many segments fit a few points more, reducing the number of total segments.
+               However, a few tests have shown that the segment reduction is insignificant
+              (240 pts, 100 err: 25 curves vs 27 curves. 140 pts, 100 err: 17 curves on both),
+              and the results take twice as many steps and milliseconds to finish,
+              without looking any better than what we already have.
+        */
+        beziers = beziers.concat(fitCubic(points.slice(0, splitPoint + 1), leftTangent, toCenterTangent, error, progressCallback));
+        beziers = beziers.concat(fitCubic(points.slice(splitPoint), fromCenterTangent, rightTangent, error, progressCallback));
+        return beziers;
+    };
+
+    function generateAndReport(points, paramsOrig, paramsPrime, leftTangent, rightTangent, progressCallback) {
+        var bezCurve, maxError, splitPoint;
+
+        bezCurve = generateBezier(points, paramsPrime, leftTangent, rightTangent, progressCallback);
+        //Find max deviation of points to fitted curve.
+        //Here we always use the original parameters (from chordLengthParameterize()),
+        //because we need to compare the current curve to the actual source polyline,
+        //and not the currently iterated parameters which reparameterize() & generateBezier() use,
+        //as those have probably drifted far away and may no longer be in ascending order.
+
+        var _computeMaxError = computeMaxError(points, bezCurve, paramsOrig);
+
+        maxError = _computeMaxError[0];
+        splitPoint = _computeMaxError[1];
+
+
+        if (progressCallback) {
+            progressCallback({
+                bez: bezCurve,
+                points: points,
+                params: paramsOrig,
+                maxErr: maxError,
+                maxPoint: splitPoint
+            });
+        }
+
+        return [bezCurve, maxError, splitPoint];
+    }
+
+    /**
+     * Use least-squares method to find Bezier control points for region.
+     *
+     * @param {Array<Array<Number>>} points - Array of digitized points
+     * @param {Array<Number>} parameters - Parameter values for region
+     * @param {Array<Number>} leftTangent - Unit tangent vector at start point
+     * @param {Array<Number>} rightTangent - Unit tangent vector at end point
+     * @returns {Array<Array<Number>>} Approximated Bezier curve: [first-point, control-point-1, control-point-2, second-point] where points are [x, y]
+     */
+    function generateBezier(points, parameters, leftTangent, rightTangent) {
+        var bezCurve,
+            //Bezier curve ctl pts
+        A,
+            a,
+            //Precomputed rhs for eqn
+        C,
+            X,
+            //Matrices C & X
+        det_C0_C1,
+            det_C0_X,
+            det_X_C1,
+            //Determinants of matrices
+        alpha_l,
+            alpha_r,
+            //Alpha values, left and right
+
+        epsilon,
+            segLength,
+            i,
+            len,
+            tmp,
+            u,
+            ux,
+            firstPoint = points[0],
+            lastPoint = points[points.length - 1];
+
+        bezCurve = [firstPoint, null, null, lastPoint];
+        //console.log('gb', parameters.length);
+
+        //Compute the A's
+        A = maths.zeros_Xx2x2(parameters.length);
+        for (i = 0, len = parameters.length; i < len; i++) {
+            u = parameters[i];
+            ux = 1 - u;
+            a = A[i];
+
+            a[0] = maths.mulItems(leftTangent, 3 * u * (ux * ux));
+            a[1] = maths.mulItems(rightTangent, 3 * ux * (u * u));
+        }
+
+        //Create the C and X matrices
+        C = [[0, 0], [0, 0]];
+        X = [0, 0];
+        for (i = 0, len = points.length; i < len; i++) {
+            u = parameters[i];
+            a = A[i];
+
+            C[0][0] += maths.dot(a[0], a[0]);
+            C[0][1] += maths.dot(a[0], a[1]);
+            C[1][0] += maths.dot(a[0], a[1]);
+            C[1][1] += maths.dot(a[1], a[1]);
+
+            tmp = maths.subtract(points[i], bezier.q([firstPoint, firstPoint, lastPoint, lastPoint], u));
+
+            X[0] += maths.dot(a[0], tmp);
+            X[1] += maths.dot(a[1], tmp);
+        }
+
+        //Compute the determinants of C and X
+        det_C0_C1 = C[0][0] * C[1][1] - C[1][0] * C[0][1];
+        det_C0_X = C[0][0] * X[1] - C[1][0] * X[0];
+        det_X_C1 = X[0] * C[1][1] - X[1] * C[0][1];
+
+        //Finally, derive alpha values
+        alpha_l = det_C0_C1 === 0 ? 0 : det_X_C1 / det_C0_C1;
+        alpha_r = det_C0_C1 === 0 ? 0 : det_C0_X / det_C0_C1;
+
+        //If alpha negative, use the Wu/Barsky heuristic (see text).
+        //If alpha is 0, you get coincident control points that lead to
+        //divide by zero in any subsequent NewtonRaphsonRootFind() call.
+        segLength = maths.vectorLen(maths.subtract(firstPoint, lastPoint));
+        epsilon = 1.0e-6 * segLength;
+        if (alpha_l < epsilon || alpha_r < epsilon) {
+            //Fall back on standard (probably inaccurate) formula, and subdivide further if needed.
+            bezCurve[1] = maths.addArrays(firstPoint, maths.mulItems(leftTangent, segLength / 3.0));
+            bezCurve[2] = maths.addArrays(lastPoint, maths.mulItems(rightTangent, segLength / 3.0));
+        } else {
+            //First and last control points of the Bezier curve are
+            //positioned exactly at the first and last data points
+            //Control points 1 and 2 are positioned an alpha distance out
+            //on the tangent vectors, left and right, respectively
+            bezCurve[1] = maths.addArrays(firstPoint, maths.mulItems(leftTangent, alpha_l));
+            bezCurve[2] = maths.addArrays(lastPoint, maths.mulItems(rightTangent, alpha_r));
+        }
+
+        return bezCurve;
+    };
+
+    /**
+     * Given set of points and their parameterization, try to find a better parameterization.
+     *
+     * @param {Array<Array<Number>>} bezier - Current fitted curve
+     * @param {Array<Array<Number>>} points - Array of digitized points
+     * @param {Array<Number>} parameters - Current parameter values
+     * @returns {Array<Number>} New parameter values
+     */
+    function reparameterize(bezier, points, parameters) {
+        /*
+        var j, len, point, results, u;
+        results = [];
+        for (j = 0, len = points.length; j < len; j++) {
+            point = points[j], u = parameters[j];
+             results.push(newtonRaphsonRootFind(bezier, point, u));
+        }
+        return results;
+        //*/
+        return parameters.map(function (p, i) {
+            return newtonRaphsonRootFind(bezier, points[i], p);
+        });
+    };
+
+    /**
+     * Use Newton-Raphson iteration to find better root.
+     *
+     * @param {Array<Array<Number>>} bez - Current fitted curve
+     * @param {Array<Number>} point - Digitized point
+     * @param {Number} u - Parameter value for "P"
+     * @returns {Number} New u
+     */
+    function newtonRaphsonRootFind(bez, point, u) {
+        /*
+            Newton's root finding algorithm calculates f(x)=0 by reiterating
+            x_n+1 = x_n - f(x_n)/f'(x_n)
+            We are trying to find curve parameter u for some point p that minimizes
+            the distance from that point to the curve. Distance point to curve is d=q(u)-p.
+            At minimum distance the point is perpendicular to the curve.
+            We are solving
+            f = q(u)-p * q'(u) = 0
+            with
+            f' = q'(u) * q'(u) + q(u)-p * q''(u)
+            gives
+            u_n+1 = u_n - |q(u_n)-p * q'(u_n)| / |q'(u_n)**2 + q(u_n)-p * q''(u_n)|
+        */
+
+        var d = maths.subtract(bezier.q(bez, u), point),
+            qprime = bezier.qprime(bez, u),
+            numerator = maths.mulMatrix(d, qprime),
+            denominator = maths.sum(maths.squareItems(qprime)) + 2 * maths.mulMatrix(d, bezier.qprimeprime(bez, u));
+
+        if (denominator === 0) {
+            return u;
+        } else {
+            return u - numerator / denominator;
+        }
+    };
+
+    /**
+     * Assign parameter values to digitized points using relative distances between points.
+     *
+     * @param {Array<Array<Number>>} points - Array of digitized points
+     * @returns {Array<Number>} Parameter values
+     */
+    function chordLengthParameterize(points) {
+        var u = [],
+            currU,
+            prevU,
+            prevP;
+
+        points.forEach(function (p, i) {
+            currU = i ? prevU + maths.vectorLen(maths.subtract(p, prevP)) : 0;
+            u.push(currU);
+
+            prevU = currU;
+            prevP = p;
+        });
+        u = u.map(function (x) {
+            return x / prevU;
+        });
+
+        return u;
+    };
+
+    /**
+     * Find the maximum squared distance of digitized points to fitted curve.
+     *
+     * @param {Array<Array<Number>>} points - Array of digitized points
+     * @param {Array<Array<Number>>} bez - Fitted curve
+     * @param {Array<Number>} parameters - Parameterization of points
+     * @returns {Array<Number>} Maximum error (squared) and point of max error
+     */
+    function computeMaxError(points, bez, parameters) {
+        var dist, //Current error
+        maxDist, //Maximum error
+        splitPoint, //Point of maximum error
+        v, //Vector from point to curve
+        i, count, point, t;
+
+        maxDist = 0;
+        splitPoint = Math.floor(points.length / 2);
+
+        var t_distMap = mapTtoRelativeDistances(bez, 10);
+
+        for (i = 0, count = points.length; i < count; i++) {
+            point = points[i];
+            //Find 't' for a point on the bez curve that's as close to 'point' as possible:
+            t = find_t(bez, parameters[i], t_distMap, 10);
+
+            v = maths.subtract(bezier.q(bez, t), point);
+            dist = v[0] * v[0] + v[1] * v[1];
+
+            if (dist > maxDist) {
+                maxDist = dist;
+                splitPoint = i;
+            }
+        }
+
+        return [maxDist, splitPoint];
+    };
+
+    //Sample 't's and map them to relative distances along the curve:
+    var mapTtoRelativeDistances = function mapTtoRelativeDistances(bez, B_parts) {
+        var B_t_curr;
+        var B_t_dist = [0];
+        var B_t_prev = bez[0];
+        var sumLen = 0;
+
+        for (var i = 1; i <= B_parts; i++) {
+            B_t_curr = bezier.q(bez, i / B_parts);
+
+            sumLen += maths.vectorLen(maths.subtract(B_t_curr, B_t_prev));
+
+            B_t_dist.push(sumLen);
+            B_t_prev = B_t_curr;
+        }
+
+        //Normalize B_length to the same interval as the parameter distances; 0 to 1:
+        B_t_dist = B_t_dist.map(function (x) {
+            return x / sumLen;
+        });
+        return B_t_dist;
+    };
+
+    function find_t(bez, param, t_distMap, B_parts) {
+        if (param < 0) {
+            return 0;
+        }
+        if (param > 1) {
+            return 1;
+        }
+
+        /*
+            'param' is a value between 0 and 1 telling us the relative position
+            of a point on the source polyline (linearly from the start (0) to the end (1)).
+            To see if a given curve - 'bez' - is a close approximation of the polyline,
+            we compare such a poly-point to the point on the curve that's the same
+            relative distance along the curve's length.
+             But finding that curve-point takes a little work:
+            There is a function "B(t)" to find points along a curve from the parametric parameter 't'
+            (also relative from 0 to 1: http://stackoverflow.com/a/32841764/1869660
+                                        http://pomax.github.io/bezierinfo/#explanation),
+            but 't' isn't linear by length (http://gamedev.stackexchange.com/questions/105230).
+             So, we sample some points along the curve using a handful of values for 't'.
+            Then, we calculate the length between those samples via plain euclidean distance;
+            B(t) concentrates the points around sharp turns, so this should give us a good-enough outline of the curve.
+            Thus, for a given relative distance ('param'), we can now find an upper and lower value
+            for the corresponding 't' by searching through those sampled distances.
+            Finally, we just use linear interpolation to find a better value for the exact 't'.
+             More info:
+                http://gamedev.stackexchange.com/questions/105230/points-evenly-spaced-along-a-bezier-curve
+                http://stackoverflow.com/questions/29438398/cheap-way-of-calculating-cubic-bezier-length
+                http://steve.hollasch.net/cgindex/curves/cbezarclen.html
+                https://github.com/retuxx/tinyspline
+        */
+        var lenMax, lenMin, tMax, tMin, t;
+
+        //Find the two t-s that the current param distance lies between,
+        //and then interpolate a somewhat accurate value for the exact t:
+        for (var i = 1; i <= B_parts; i++) {
+
+            if (param <= t_distMap[i]) {
+                tMin = (i - 1) / B_parts;
+                tMax = i / B_parts;
+                lenMin = t_distMap[i - 1];
+                lenMax = t_distMap[i];
+
+                t = (param - lenMin) / (lenMax - lenMin) * (tMax - tMin) + tMin;
+                break;
+            }
+        }
+        return t;
+    }
+
+    /**
+     * Creates a vector of length 1 which shows the direction from B to A
+     */
+    function createTangent(pointA, pointB) {
+        return maths.normalize(maths.subtract(pointA, pointB));
+    }
+
+    /*
+        Simplified versions of what we need from math.js
+        Optimized for our input, which is only numbers and 1x2 arrays (i.e. [x, y] coordinates).
+    */
+
+    var maths = function () {
+        function maths() {
+            _classCallCheck(this, maths);
+        }
+
+        maths.zeros_Xx2x2 = function zeros_Xx2x2(x) {
+            var zs = [];
+            while (x--) {
+                zs.push([0, 0]);
+            }
+            return zs;
+        };
+
+        maths.mulItems = function mulItems(items, multiplier) {
+            return items.map(function (x) {
+                return x * multiplier;
+            });
+        };
+
+        maths.mulMatrix = function mulMatrix(m1, m2) {
+            //https://en.wikipedia.org/wiki/Matrix_multiplication#Matrix_product_.28two_matrices.29
+            //Simplified to only handle 1-dimensional matrices (i.e. arrays) of equal length:
+            return m1.reduce(function (sum, x1, i) {
+                return sum + x1 * m2[i];
+            }, 0);
+        };
+
+        maths.subtract = function subtract(arr1, arr2) {
+            return arr1.map(function (x1, i) {
+                return x1 - arr2[i];
+            });
+        };
+
+        maths.addArrays = function addArrays(arr1, arr2) {
+            return arr1.map(function (x1, i) {
+                return x1 + arr2[i];
+            });
+        };
+
+        maths.addItems = function addItems(items, addition) {
+            return items.map(function (x) {
+                return x + addition;
+            });
+        };
+
+        maths.sum = function sum(items) {
+            return items.reduce(function (sum, x) {
+                return sum + x;
+            });
+        };
+
+        maths.dot = function dot(m1, m2) {
+            return maths.mulMatrix(m1, m2);
+        };
+
+        maths.vectorLen = function vectorLen(v) {
+            return Math.hypot.apply(Math, v);
+        };
+
+        maths.divItems = function divItems(items, divisor) {
+            return items.map(function (x) {
+                return x / divisor;
+            });
+        };
+
+        maths.squareItems = function squareItems(items) {
+            return items.map(function (x) {
+                return x * x;
+            });
+        };
+
+        maths.normalize = function normalize(v) {
+            return this.divItems(v, this.vectorLen(v));
+        };
+
+        return maths;
+    }();
+
+    var bezier = function () {
+        function bezier() {
+            _classCallCheck(this, bezier);
+        }
+
+        bezier.q = function q(ctrlPoly, t) {
+            var tx = 1.0 - t;
+            var pA = maths.mulItems(ctrlPoly[0], tx * tx * tx),
+                pB = maths.mulItems(ctrlPoly[1], 3 * tx * tx * t),
+                pC = maths.mulItems(ctrlPoly[2], 3 * tx * t * t),
+                pD = maths.mulItems(ctrlPoly[3], t * t * t);
+            return maths.addArrays(maths.addArrays(pA, pB), maths.addArrays(pC, pD));
+        };
+
+        bezier.qprime = function qprime(ctrlPoly, t) {
+            var tx = 1.0 - t;
+            var pA = maths.mulItems(maths.subtract(ctrlPoly[1], ctrlPoly[0]), 3 * tx * tx),
+                pB = maths.mulItems(maths.subtract(ctrlPoly[2], ctrlPoly[1]), 6 * tx * t),
+                pC = maths.mulItems(maths.subtract(ctrlPoly[3], ctrlPoly[2]), 3 * t * t);
+            return maths.addArrays(maths.addArrays(pA, pB), pC);
+        };
+
+        bezier.qprimeprime = function qprimeprime(ctrlPoly, t) {
+            return maths.addArrays(maths.mulItems(maths.addArrays(maths.subtract(ctrlPoly[2], maths.mulItems(ctrlPoly[1], 2)), ctrlPoly[0]), 6 * (1.0 - t)), maths.mulItems(maths.addArrays(maths.subtract(ctrlPoly[3], maths.mulItems(ctrlPoly[2], 2)), ctrlPoly[1]), 6 * t));
+        };
+
+        return bezier;
+    }();
+
+    module.exports = fitCurve;
+    module.exports.fitCubic = fitCubic;
+    module.exports.createTangent = createTangent;
+});
+
+</script>
+
 <!-- MapLibre GL -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/maplibre-gl@5.3.0/dist/maplibre-gl.css">
 <script src="https://cdn.jsdelivr.net/npm/maplibre-gl@5.3.0/dist/maplibre-gl.js" crossorigin="anonymous"></script>
@@ -1539,7 +2176,7 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
 
   <!-- ============== TOPBAR ============== -->
   <div class="topbar">
-    <div class="topbar-title">Map Tool <span>v0.13</span></div>
+    <div class="topbar-title">Map Tool <span>v0.18</span></div>
     <div style="display:flex; gap:8px; margin-left:6px;">
       <button class="btn small primary" id="btnTopbarSave" title="Salva tutto il progetto in un file JSON">💾 Salva</button>
       <button class="btn small" id="btnTopbarOpen" title="Apri un progetto salvato (JSON) — sostituisce il lavoro corrente">📂 Apri</button>
@@ -1567,6 +2204,7 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
       <button class="tab" data-tab="boundaries">Confini</button>
       <button class="tab" data-tab="iso">Isocrone</button>
       <button class="tab" data-tab="style">Stile</button>
+      <button class="tab" data-tab="legend">Legenda</button>
       <button class="tab" data-tab="export">Export</button>
     </div>
 
@@ -1763,41 +2401,6 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
       </div>
 
       <div class="section">
-        <div class="section-title">Legenda</div>
-        <label class="field" style="margin-bottom: 6px;">
-          <span class="label" style="display: flex; align-items: center; gap: 6px;">
-            <input type="checkbox" id="legendOn">
-            Mostra la legenda
-          </span>
-        </label>
-        <label class="field">
-          <span class="label">Titolo</span>
-          <input type="text" id="legendTitle" placeholder="es. Legenda">
-        </label>
-        <label class="field">
-          <span class="label">Dimensione</span>
-          <div class="slider-row">
-            <input type="range" id="legendScale" min="50" max="250" step="10" value="100">
-            <span class="slider-value" id="legendScaleVal">100%</span>
-          </div>
-        </label>
-        <div class="section-row">
-          <label style="display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-secondary); flex: 1;">
-            <input type="checkbox" id="legendBg" checked> Sfondo bianco
-          </label>
-          <button class="btn small" id="legendReset" title="Riporta la legenda nell'angolo in basso a sinistra">Riporta in angolo</button>
-        </div>
-        <div class="help" style="margin-bottom: 8px;">Trascina la legenda sulla mappa: resta dentro il riquadro di export, nella stessa posizione e proporzione che avrà nell'SVG (gruppo "legenda", spostabile).</div>
-        <div class="section-title" style="margin-top: 6px;">Voci</div>
-        <div id="legendItems" class="item-list"></div>
-        <div class="section-row" style="margin-top: 8px;">
-          <button class="btn small" id="legendAllOn">Tutte</button>
-          <button class="btn small" id="legendAllOff">Nessuna</button>
-          <button class="btn small" id="legendAddCustom" style="margin-left: auto;">+ Voce libera</button>
-        </div>
-      </div>
-
-      <div class="section">
         <div class="section-title">Mappa di base</div>
         <select id="basemapSelect">
           <optgroup label="Raster (sempre funzionanti)">
@@ -1828,6 +2431,83 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
           </select>
         </label>
         <div class="help">Funziona solo sulle basemap vettoriali (OpenFreeMap Liberty/Bright/Positron/Dark). I raster sono già pre-renderizzati in inglese.</div>
+      </div>
+
+    </div>
+
+    <!-- ===== Panel: Export ===== -->
+    <!-- ===== Panel: Legenda ===== -->
+    <div class="panel" data-panel="legend">
+
+      <div class="section">
+        <div class="section-title">Legenda</div>
+        <label class="field" style="margin-bottom: 6px;">
+          <span class="label" style="display: flex; align-items: center; gap: 6px;">
+            <input type="checkbox" id="legendOn">
+            Mostra la legenda
+          </span>
+        </label>
+        <label class="field">
+          <span class="label">Titolo</span>
+          <input type="text" id="legendTitle" placeholder="es. Legenda">
+        </label>
+        <label class="field">
+          <span class="label">Dimensione</span>
+          <div class="slider-row">
+            <input type="range" id="legendScale" min="50" max="250" step="10" value="100">
+            <span class="slider-value" id="legendScaleVal">100%</span>
+          </div>
+        </label>
+        <div class="section-row">
+          <label style="display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-secondary); flex: 1;">
+            <input type="checkbox" id="legendBg" checked> Sfondo bianco
+          </label>
+          <button class="btn small" id="legendReset" title="Riporta la legenda nell'angolo in basso a sinistra">Riporta in angolo</button>
+        </div>
+        <div class="help" style="margin-bottom: 8px;">Trascina la legenda sulla mappa: resta dentro il riquadro di export, nella stessa posizione e proporzione che avrà nell'SVG (gruppo "legenda", spostabile).</div>
+        <div class="section-title" style="margin-top: 10px;">Aspetto</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+          <label class="field" style="margin: 0;"><span class="label">Sfondo</span>
+            <div style="display:flex; gap:6px; align-items:center;"><input type="color" id="lgBg" value="#ffffff"><input type="range" id="lgBgOp" min="0" max="100" value="94" style="flex:1;" title="Opacità sfondo"><span class="slider-value" id="lgBgOpVal">94%</span></div></label>
+          <label class="field" style="margin: 0;"><span class="label">Bordo</span>
+            <div style="display:flex; gap:6px; align-items:center;"><input type="color" id="lgBorder" value="#9aa5b1"><input type="number" id="lgBorderW" min="0" max="10" step="0.2" value="0.6" style="width:60px; font-family: var(--font-mono);" title="Spessore bordo"></div></label>
+        </div>
+        <label class="field" style="margin-top: 8px;"><span class="label">Angoli (raggio): alto-sx · alto-dx · basso-dx · basso-sx</span>
+          <div style="display:flex; gap:6px; align-items:center;">
+            <input type="number" id="lgRtl" min="0" max="60" step="1" value="3" style="font-family: var(--font-mono);">
+            <input type="number" id="lgRtr" min="0" max="60" step="1" value="3" style="font-family: var(--font-mono);">
+            <input type="number" id="lgRbr" min="0" max="60" step="1" value="3" style="font-family: var(--font-mono);">
+            <input type="number" id="lgRbl" min="0" max="60" step="1" value="3" style="font-family: var(--font-mono);">
+            <button class="btn small" id="lgRAll" title="Applica il primo valore a tutti gli angoli">= tutti</button>
+          </div>
+          <div class="help">0 = angolo retto. Valori diversi per ogni angolo sono ammessi.</div>
+        </label>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+          <label class="field" style="margin: 0;"><span class="label">Font</span>
+            <select id="lgFont">
+              <option value="sans">Helvetica / Arial</option>
+              <option value="serif">Georgia / Times</option>
+              <option value="mono">Courier</option>
+              <option value="narrow">Arial Narrow</option>
+              <option value="custom">Personalizzato…</option>
+            </select></label>
+          <label class="field" style="margin: 0;"><span class="label">Colore testo</span><input type="color" id="lgText" value="#18222d"></label>
+        </div>
+        <input type="text" id="lgFontCustom" placeholder="es. Futura, Avenir, sans-serif" style="display:none; margin-top:6px; font-family: var(--font-mono);">
+        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 8px;">
+          <label class="field" style="margin: 0;"><span class="label">Titolo (pt)</span><input type="number" id="lgTitleSize" min="6" max="60" step="0.5" value="12.5" style="font-family: var(--font-mono);"></label>
+          <label class="field" style="margin: 0;"><span class="label">Voci (pt)</span><input type="number" id="lgItemSize" min="5" max="48" step="0.5" value="11.5" style="font-family: var(--font-mono);"></label>
+          <label class="field" style="margin: 0;"><span class="label">Margine</span><input type="number" id="lgPad" min="2" max="60" step="1" value="12" style="font-family: var(--font-mono);"></label>
+        </div>
+        <div class="help">Le misure sono in unità SVG (con dimensione 100%). Il font va scelto tra quelli che avrai anche in Affinity/Illustrator: nel file SVG viene scritto il nome, non incorporato.</div>
+
+        <div class="section-title" style="margin-top: 12px;">Voci</div>
+        <div id="legendItems" class="item-list"></div>
+        <div class="section-row" style="margin-top: 8px;">
+          <button class="btn small" id="legendAllOn">Tutte</button>
+          <button class="btn small" id="legendAllOff">Nessuna</button>
+          <button class="btn small" id="legendAddCustom" style="margin-left: auto;">+ Voce libera</button>
+        </div>
       </div>
 
     </div>
@@ -1900,6 +2580,10 @@ document.addEventListener('DOMContentLoaded', __renderErrorBox);
         </label>
         <label class="field" style="margin-bottom: 0;">
           <span class="label" style="display: flex; align-items: center; gap: 6px;"><input type="checkbox" id="exportGray"> Sfondo in scala di grigi</span>
+        </label>
+        <label class="field" style="margin-bottom: 0;">
+          <span class="label" style="display: flex; align-items: center; gap: 6px;"><input type="checkbox" id="exportCurves" checked> Confini e isocrone come curve di Bézier (come "Semplifica" di Inkscape)</span>
+          <div class="help">Le spezzate diventano curve lisce con pochi nodi, entro la tolleranza di semplificazione della forma (0,75 unità se non semplificata). Spegni per avere i vertici esatti.</div>
         </label>
       </div>
 
@@ -7155,6 +7839,7 @@ function openShapePopup(kind, owner, lngLat) {
       </div>
     </div>
   `;
+  html += simplifyRowHtml(kind, owner, id);
   // Actions
   html += `
     <div class="sp-actions">
@@ -7177,6 +7862,7 @@ function openShapePopup(kind, owner, lngLat) {
     const fc = document.getElementById(id + '_fc');
     const fo = document.getElementById(id + '_fo');
     const foVal = document.getElementById(id + '_foVal');
+    bindSimplifyRow(document, kind, owner, id, () => { if (isBoundary) { redrawBoundaries(); redrawSpotlight(); } else { redrawIsochrones(); } });
     const dash = document.getElementById(id + '_dash');
     const refresh = () => {
       if (isBoundary) {
@@ -7357,12 +8043,75 @@ function findShapeById(id) {
 }
 
 // Convert any shape to a turf Feature with Polygon/MultiPolygon geometry.
+/* ---------- Semplificazione per forma (non distruttiva) ----------
+   Ogni confine/isocrona ha una tolleranza in metri (0 = originale). La geometria
+   originale non viene mai toccata: quella semplificata (Douglas-Peucker, turf)
+   è calcolata al volo e messa in cache; a schermo, negli export e nelle
+   operazioni booleane si usa sempre la versione semplificata. */
+function countVertices(geom) {
+  let n = 0;
+  const walk = a => { if (!Array.isArray(a)) return; if (typeof a[0] === 'number') { n++; return; } for (const s of a) walk(s); };
+  if (geom) walk(geom.coordinates);
+  return n;
+}
+function simplifyFeature(feature, meters) {
+  if (!feature || !feature.geometry || !(meters > 0)) return feature;
+  try {
+    const out = turf.simplify(feature, { tolerance: meters / 111320, highQuality: false, mutate: false });
+    return (out && out.geometry && countVertices(out.geometry) >= 4) ? out : feature;
+  } catch (e) { console.warn('simplify', e); return feature; }
+}
+// Confine: Feature semplificata (cache per tolleranza)
+function boundaryFeature(b) {
+  const tol = b.simplify || 0;
+  if (!tol) return b.feature;
+  if (!b._simp || b._simp.tol !== tol || b._simp.src !== b.feature) b._simp = { tol, src: b.feature, feature: simplifyFeature(b.feature, tol) };
+  return b._simp.feature;
+}
+// Isocrona: array di Feature semplificate
+function isoFeatures(iso) {
+  const tol = iso.simplify || 0;
+  const feats = (iso.geojson && iso.geojson.features) || [];
+  if (!tol) return feats;
+  if (!iso._simp || iso._simp.tol !== tol || iso._simp.src !== iso.geojson) iso._simp = { tol, src: iso.geojson, features: feats.map(f => simplifyFeature(f, tol)) };
+  return iso._simp.features;
+}
+function shapeVertexInfo(kind, shape) {
+  if (kind === 'boundary') return { orig: countVertices(shape.feature.geometry), now: countVertices(boundaryFeature(shape).geometry) };
+  const o = ((shape.geojson && shape.geojson.features) || []).reduce((n, f) => n + countVertices(f.geometry), 0);
+  const s = isoFeatures(shape).reduce((n, f) => n + countVertices(f.geometry), 0);
+  return { orig: o, now: s };
+}
+const SIMPLIFY_STEPS = [0, 5, 10, 20, 50, 100, 200, 500, 1000, 2000];   // metri, scala non lineare per lo slider
+function simplifyLabel(m) { return m ? (m >= 1000 ? (m / 1000) + ' km' : m + ' m') : 'originale'; }
+// Riga di controllo riusabile (popup e pannelli): slider a passi + conteggio vertici
+function simplifyRowHtml(kind, shape, uid) {
+  const idx = Math.max(0, SIMPLIFY_STEPS.indexOf(shape.simplify || 0));
+  const vi = shapeVertexInfo(kind, shape);
+  return `<div class="sp-row" style="margin-top:4px;">
+      <label title="Semplifica la curva (Douglas-Peucker): meno vertici, file più leggeri. La geometria originale resta salvata.">Semplifica</label>
+      <input type="range" min="0" max="${SIMPLIFY_STEPS.length - 1}" step="1" value="${idx}" data-simplify="${uid}" style="flex:1;">
+      <span class="val" data-simplify-val="${uid}" style="width:auto; white-space:nowrap;">${simplifyLabel(shape.simplify || 0)} · ${vi.now.toLocaleString('it-IT')}${shape.simplify ? '/' + vi.orig.toLocaleString('it-IT') : ''} vertici</span>
+    </div>`;
+}
+function bindSimplifyRow(root, kind, shape, uid, onChange) {
+  const inp = root.querySelector(`[data-simplify="${uid}"]`);
+  const val = root.querySelector(`[data-simplify-val="${uid}"]`);
+  if (!inp) return;
+  inp.addEventListener('input', () => {
+    shape.simplify = SIMPLIFY_STEPS[parseInt(inp.value, 10)] || 0;
+    const vi = shapeVertexInfo(kind, shape);
+    if (val) val.textContent = `${simplifyLabel(shape.simplify)} · ${vi.now.toLocaleString('it-IT')}${shape.simplify ? '/' + vi.orig.toLocaleString('it-IT') : ''} vertici`;
+    if (onChange) onChange();
+  });
+}
+
 function shapeToFeature(kind, shape) {
   if (kind === 'boundary') {
-    return shape.feature;
+    return boundaryFeature(shape);
   } else {
     // iso: take all features and merge by union if multiple
-    const feats = shape.geojson.features;
+    const feats = isoFeatures(shape);
     if (feats.length === 1) return feats[0];
     // Union all features into one
     let acc = feats[0];
@@ -7784,14 +8533,14 @@ function redrawBoundaries() {
 
   const fillFeats = visibleBoundaries.map(b => ({
     type: 'Feature',
-    geometry: b.feature.geometry,
+    geometry: boundaryFeature(b).geometry,
     properties: { _id: b.id, fillColor: b.color, fillOpacity: b.fillOpacity || 0 },
   }));
   const lineFeats = visibleBoundaries.map(b => {
     const wpx = resolveStrokeWidthPx(b);
     return {
       type: 'Feature',
-      geometry: b.feature.geometry,
+      geometry: boundaryFeature(b).geometry,
       properties: {
         _id: b.id,
         strokeColor: b.strokeColor,
@@ -7897,7 +8646,7 @@ function updateBoundaryLineDashes() {
     const sid = 'boundary-dashed-' + b.id;
     map.addSource(sid, {
       type: 'geojson',
-      data: { type: 'Feature', geometry: b.feature.geometry, properties: {} },
+      data: { type: 'Feature', geometry: boundaryFeature(b).geometry, properties: {} },
     });
     const wpx = resolveStrokeWidthPx(b);
     map.addLayer({
@@ -7919,7 +8668,7 @@ function updateBoundaryLineDashes() {
     const wpx = resolveStrokeWidthPx(b);
     return {
       type: 'Feature',
-      geometry: b.feature.geometry,
+      geometry: boundaryFeature(b).geometry,
       properties: {
         _id: b.id,
         strokeColor: b.strokeColor,
@@ -7979,7 +8728,9 @@ function renderBoundaryStyleList() {
           </select>
         </label>
       </div>
+      ${simplifyRowHtml('boundary', b, 'bs_' + b.id)}
     `;
+    bindSimplifyRow(div, 'boundary', b, 'bs_' + b.id, () => { redrawBoundaries(); redrawSpotlight(); });
     c.appendChild(div);
   }
   c.querySelectorAll('[data-bid]').forEach(inp => {
@@ -8043,7 +8794,7 @@ function redrawSpotlight() {
     return;
   }
   // Build union of visible boundaries
-  const union = unionAll(visibleBoundaries.map(b => b.feature));
+  const union = unionAll(visibleBoundaries.map(b => boundaryFeature(b)));
   if (!union) { STATE.map.getSource('spotlight-mask').setData(emptyFC()); return; }
   // Build a world rectangle and difference the union
   const world = turf.polygon([[
@@ -8199,6 +8950,7 @@ function renderIsoList() {
           <label style="display:flex; align-items:center; gap:5px; font-size:11px; color:var(--text-secondary);">
             Spessore <input type="number" min="0" max="30" step="0.5" data-iid="${iso.id}" data-prop="strokeWidth" value="${iso.strokeWidth != null ? iso.strokeWidth : 1.2}" style="width:58px; padding:2px 5px; font-family: var(--font-mono);">
           </label>
+          <div style="flex-basis:100%;">${simplifyRowHtml('iso', iso, 'is_' + iso.id)}</div>
           <label style="display:flex; align-items:center; gap:5px; font-size:11px; color:var(--text-secondary);">
             Bordo
             <select data-iid="${iso.id}" data-prop="strokeAlignment" style="font-size:11px; padding:2px 5px;">
@@ -8225,6 +8977,7 @@ function renderIsoList() {
       const row = li.querySelector('[data-iso-style]');
       if (row) row.style.display = row.style.display === 'none' ? 'block' : 'none';
     });
+    bindSimplifyRow(li, 'iso', iso, 'is_' + iso.id, () => redrawIsochrones());
     li.querySelectorAll('[data-iid]').forEach(inp => {
       const evt = inp.tagName === 'SELECT' ? 'change' : 'input';
       inp.addEventListener(evt, () => {
@@ -8264,7 +9017,7 @@ function redrawIsochrones() {
   const lineFeats = [];
   for (const iso of STATE.isochrones) {
     if (!iso.visible) continue;
-    for (const f of iso.geojson.features) {
+    for (const f of isoFeatures(iso)) {
       fillFeats.push({
         type: 'Feature',
         geometry: f.geometry,
@@ -8574,6 +9327,26 @@ function initFrameUI() {
    riusa gli stessi <symbol> dei punti. Impianto da cartogramma.html.
 */
 const LEGEND_ROW = 19, LEGEND_SW = 18, LEGEND_FONT = 11.5, LEGEND_TITLE_FONT = 12.5, LEGEND_PAD = 12;
+const LEGEND_FONTS = {
+  sans:  'Helvetica, Arial, sans-serif',
+  serif: 'Georgia, "Times New Roman", serif',
+  mono:  '"Courier New", Courier, monospace',
+  narrow: '"Arial Narrow", "Helvetica Neue", Arial, sans-serif',
+};
+const LEGEND_STYLE_DEFAULT = {
+  bg: '#ffffff', bgOpacity: 0.94, border: '#9aa5b1', borderWidth: 0.6,
+  radius: { tl: 3, tr: 3, br: 3, bl: 3 },
+  font: 'sans', fontCustom: '', titleSize: 12.5, itemSize: 11.5, textColor: '#18222d', padding: 12,
+};
+// Stile della legenda con i default; derivati: riga, campione, font-family
+function legendStyle() {
+  const L = legendState();
+  L.style = { ...LEGEND_STYLE_DEFAULT, ...(L.style || {}), radius: { ...LEGEND_STYLE_DEFAULT.radius, ...((L.style || {}).radius || {}) } };
+  const st = L.style;
+  const family = st.font === 'custom' && st.fontCustom ? st.fontCustom : (LEGEND_FONTS[st.font] || LEGEND_FONTS.sans);
+  const k = st.itemSize / LEGEND_FONT;
+  return { ...st, family, row: r2(LEGEND_ROW * k), sw: r2(LEGEND_SW * k), gap: r2(9 * k) };
+}
 
 function legendState() {
   if (!STATE.legend) STATE.legend = { enabled: false, title: '', items: [], pos: null, scale: 1, bg: true };
@@ -8621,16 +9394,16 @@ function legendEntries() {
 }
 
 /* ---------- campioni (HTML a schermo) ---------- */
-function legendSwatchHtml(e) {
-  const it = e.it, ref = e.ref;
-  if (it.kind === 'layer') return normalizeSvgSize(ref.icon || defaultMarkerSvg(ref.color), LEGEND_SW);
-  if (it.kind === 'iso') return `<span style="display:block;width:${LEGEND_SW}px;height:${LEGEND_SW}px;background:${ref.color};opacity:${ref.opacity != null ? Math.max(0.2, ref.opacity) : 0.35};border:1px solid ${ref.color};"></span>`;
+function legendSwatchHtml(e, swPx) {
+  const it = e.it, ref = e.ref, SW = swPx || LEGEND_SW;
+  if (it.kind === 'layer') return normalizeSvgSize(ref.icon || defaultMarkerSvg(ref.color), SW);
+  if (it.kind === 'iso') return `<span style="display:block;width:${SW}px;height:${SW}px;background:${ref.color};opacity:${ref.opacity != null ? Math.max(0.2, ref.opacity) : 0.35};border:1px solid ${ref.color};"></span>`;
   if (it.kind === 'boundary') {
     const wpx = Math.min(6, Math.max(1, ref.strokeWidthMode === 'm' ? 2 : (ref.strokeWidth || 2)));
     const fill = (ref.fillOpacity || 0) > 0 ? `<rect x="1" y="1" width="16" height="16" fill="${ref.color}" fill-opacity="${ref.fillOpacity}"/>` : '';
-    return `<svg width="${LEGEND_SW}" height="${LEGEND_SW}" viewBox="0 0 18 18">${fill}<path d="M1 14 L7 5 L11 11 L17 3" fill="none" stroke="${ref.strokeColor}" stroke-width="${wpx}" ${ref.dashed ? 'stroke-dasharray="3,2"' : ''} stroke-linejoin="round" stroke-linecap="round"/></svg>`;
+    return `<svg width="${SW}" height="${SW}" viewBox="0 0 18 18">${fill}<path d="M1 14 L7 5 L11 11 L17 3" fill="none" stroke="${ref.strokeColor}" stroke-width="${wpx}" ${ref.dashed ? 'stroke-dasharray="3,2"' : ''} stroke-linejoin="round" stroke-linecap="round"/></svg>`;
   }
-  return `<span style="display:block;width:${LEGEND_SW}px;height:${LEGEND_SW}px;background:${it.color || '#888'};border:1px solid #9aa5b1;"></span>`;
+  return `<span style="display:block;width:${SW}px;height:${SW}px;background:${it.color || '#888'};border:1px solid #9aa5b1;"></span>`;
 }
 
 /* ---------- pannello Stile → Legenda ---------- */
@@ -8642,10 +9415,21 @@ function renderLegendPanel() {
   const sc = document.getElementById('legendScale'); if (sc) sc.value = Math.round((L.scale || 1) * 100);
   const scv = document.getElementById('legendScaleVal'); if (scv) scv.textContent = Math.round((L.scale || 1) * 100) + '%';
   const bg = document.getElementById('legendBg'); if (bg) bg.checked = L.bg !== false;
+  const st = legendStyle();
+  const setv = (id, v) => { const e = document.getElementById(id); if (e && document.activeElement !== e) e.value = v; };
+  setv('lgBg', st.bg); setv('lgBgOp', Math.round(st.bgOpacity * 100)); setv('lgBorder', st.border); setv('lgBorderW', st.borderWidth);
+  setv('lgRtl', st.radius.tl); setv('lgRtr', st.radius.tr); setv('lgRbr', st.radius.br); setv('lgRbl', st.radius.bl);
+  setv('lgFont', st.font); setv('lgFontCustom', st.fontCustom); setv('lgText', st.textColor);
+  setv('lgTitleSize', st.titleSize); setv('lgItemSize', st.itemSize); setv('lgPad', st.padding);
+  const bov = document.getElementById('lgBgOpVal'); if (bov) bov.textContent = Math.round(st.bgOpacity * 100) + '%';
+  const fc = document.getElementById('lgFontCustom'); if (fc) fc.style.display = st.font === 'custom' ? '' : 'none';
   const list = document.getElementById('legendItems');
   if (!list) return;
   list.innerHTML = '';
   if (!items.length) { list.innerHTML = '<div class="empty">Nessun elemento: carica punti, confini o isocrone, o aggiungi una voce libera.</div>'; return; }
+  if (L.enabled && !items.some(it => it.on) && !L.title) {
+    list.innerHTML = '<div class="help" style="color: var(--warn); margin-bottom: 6px;">Legenda accesa ma vuota: spunta almeno una voce o scrivi un titolo.</div>';
+  }
   items.forEach((it, i) => {
     const ref = legendRef(it);
     const row = document.createElement('div');
@@ -8676,12 +9460,34 @@ function renderLegendPanel() {
 function legendSync() { renderLegendPanel(); drawLegend(); }
 
 function initLegendUI() {
-  const L = legendState();
-  document.getElementById('legendOn').addEventListener('change', e => { L.enabled = e.target.checked; drawLegend(); });
-  document.getElementById('legendTitle').addEventListener('input', e => { L.title = e.target.value; drawLegend(); });
-  document.getElementById('legendScale').addEventListener('input', e => { L.scale = (+e.target.value || 100) / 100; document.getElementById('legendScaleVal').textContent = e.target.value + '%'; placeLegend(); });
-  document.getElementById('legendBg').addEventListener('change', e => { L.bg = e.target.checked; drawLegend(); });
-  document.getElementById('legendReset').addEventListener('click', () => { L.pos = null; placeLegend(); });
+  // Nessuna cattura di STATE.legend: applyProjectJson lo sostituisce con un oggetto
+  // nuovo, e i gestori legati al vecchio oggetto non avrebbero più effetto.
+  document.getElementById('legendOn').addEventListener('change', e => {
+    legendState().enabled = e.target.checked;
+    if (legendState().enabled) {
+      const items = legendSyncItems();
+      if (items.length && !items.some(it => it.on)) items.forEach(it => it.on = true);   // niente selezionato: tutto, così si vede subito
+      renderLegendPanel();
+    }
+    drawLegend();
+  });
+  document.getElementById('legendTitle').addEventListener('input', e => { legendState().title = e.target.value; drawLegend(); });
+  document.getElementById('legendScale').addEventListener('input', e => { legendState().scale = (+e.target.value || 100) / 100; document.getElementById('legendScaleVal').textContent = e.target.value + '%'; placeLegend(); });
+  document.getElementById('legendBg').addEventListener('change', e => { legendState().bg = e.target.checked; drawLegend(); });
+  document.getElementById('legendReset').addEventListener('click', () => { legendState().pos = null; placeLegend(); });
+  // Aspetto
+  const S = () => { legendStyle(); return legendState().style; };
+  const num = (id, f) => document.getElementById(id).addEventListener('input', e => { const v = parseFloat(e.target.value); if (Number.isFinite(v)) { f(S(), v); drawLegend(); } });
+  document.getElementById('lgBg').addEventListener('input', e => { S().bg = e.target.value; drawLegend(); });
+  document.getElementById('lgBgOp').addEventListener('input', e => { S().bgOpacity = (+e.target.value) / 100; document.getElementById('lgBgOpVal').textContent = e.target.value + '%'; drawLegend(); });
+  document.getElementById('lgBorder').addEventListener('input', e => { S().border = e.target.value; drawLegend(); });
+  num('lgBorderW', (s, v) => s.borderWidth = v);
+  num('lgRtl', (s, v) => s.radius.tl = v); num('lgRtr', (s, v) => s.radius.tr = v); num('lgRbr', (s, v) => s.radius.br = v); num('lgRbl', (s, v) => s.radius.bl = v);
+  document.getElementById('lgRAll').addEventListener('click', () => { const v = parseFloat(document.getElementById('lgRtl').value) || 0; const s = S(); s.radius = { tl: v, tr: v, br: v, bl: v }; renderLegendPanel(); drawLegend(); });
+  document.getElementById('lgFont').addEventListener('change', e => { S().font = e.target.value; document.getElementById('lgFontCustom').style.display = e.target.value === 'custom' ? '' : 'none'; drawLegend(); });
+  document.getElementById('lgFontCustom').addEventListener('input', e => { S().fontCustom = e.target.value; drawLegend(); });
+  document.getElementById('lgText').addEventListener('input', e => { S().textColor = e.target.value; drawLegend(); });
+  num('lgTitleSize', (s, v) => s.titleSize = v); num('lgItemSize', (s, v) => s.itemSize = v); num('lgPad', (s, v) => s.padding = v);
   document.getElementById('legendAddCustom').addEventListener('click', () => {
     legendSyncItems().push({ kind: 'custom', id: newId(), on: true, label: 'Nuova voce', color: '#888888' });
     renderLegendPanel(); drawLegend();
@@ -8716,19 +9522,46 @@ function drawLegend() {
   if (!L.enabled || (!entries.length && !L.title)) { el.style.display = 'none'; return; }
   el.style.display = 'block';
   el.classList.toggle('nobg', L.bg === false);
-  let h = L.title ? `<b class="lg-title">${escapeHtml(L.title)}</b>` : '';
-  for (const e of entries) h += `<div class="lg-it"><span class="lg-sw">${legendSwatchHtml(e)}</span><span>${escapeHtml(e.label)}</span></div>`;
+  const st = legendStyle();
+  const rad = st.radius;
+  // Aspetto: sfondo, bordo, angoli, font (stesse misure dell'SVG, 1 unità = 1 px qui)
+  if (L.bg !== false) {
+    const a = Math.round(st.bgOpacity * 255).toString(16).padStart(2, '0');
+    el.style.background = st.bg + a;
+    el.style.border = st.borderWidth > 0 ? `${st.borderWidth}px solid ${st.border}` : 'none';
+    el.style.boxShadow = '0 1px 4px rgba(0,0,0,0.25)';
+  } else { el.style.background = 'transparent'; el.style.border = 'none'; el.style.boxShadow = 'none'; }
+  el.style.borderRadius = `${rad.tl}px ${rad.tr}px ${rad.br}px ${rad.bl}px`;
+  el.style.fontFamily = st.family;
+  el.style.fontSize = st.itemSize + 'px';
+  el.style.color = st.textColor;
+  el.style.padding = `${r2(st.padding * 0.66)}px ${st.padding}px`;
+  let h = L.title ? `<b class="lg-title" style="font-size:${st.titleSize}px;">${escapeHtml(L.title)}</b>` : '';
+  for (const e of entries) h += `<div class="lg-it" style="height:${st.row}px; gap:${st.gap}px;"><span class="lg-sw" style="width:${st.sw}px; height:${st.sw}px;">${legendSwatchHtml(e, st.sw)}</span><span>${escapeHtml(e.label)}</span></div>`;
   el.innerHTML = h;
+  el.querySelectorAll('.lg-sw svg').forEach(s => { s.style.maxWidth = st.sw + 'px'; s.style.maxHeight = st.sw + 'px'; });
   placeLegend();
 }
 function placeLegend() {
   const el = document.getElementById('mapLegend');
   if (!el || el.style.display === 'none' || !STATE.map) return;
   const L = legendState();
-  const B = legendBox(), sc = B.k * (L.scale || 1);
+  let B = legendBox();
+  // Riquadro troppo piccolo sullo schermo (mappa zoomata indietro): la legenda si
+  // aggancia alla vista, altrimenti sarebbe un puntino. L'export non cambia.
+  if (B.w < 200 || B.h < 120) {
+    const c = STATE.map.getContainer();
+    B = { x: 0, y: 0, w: c.clientWidth, h: c.clientHeight, k: 1, W: c.clientWidth, H: c.clientHeight };
+  }
+  const sc = Math.max(0.5, B.k * (L.scale || 1));   // mai sotto il 50%: deve restare leggibile
   const lw = el.offsetWidth * sc, lh = el.offsetHeight * sc, p = L.pos || defLegendPos();
-  const x = p.ax === 'l' ? B.x + p.fx * B.w : B.x + B.w - p.fx * B.w - lw;
-  const y = p.ay === 't' ? B.y + p.fy * B.h : B.y + B.h - p.fy * B.h - lh;
+  let x = p.ax === 'l' ? B.x + p.fx * B.w : B.x + B.w - p.fx * B.w - lw;
+  let y = p.ay === 't' ? B.y + p.fy * B.h : B.y + B.h - p.fy * B.h - lh;
+  // Il riquadro può sporgere dallo schermo (mappa zoomata dentro): la legenda va
+  // comunque tenuta nell'area visibile, altrimenti sparisce. Solo a schermo.
+  const c = STATE.map.getContainer();
+  x = Math.max(4, Math.min(c.clientWidth - lw - 4, x));
+  y = Math.max(4, Math.min(c.clientHeight - lh - 4, y));
   el.style.transform = `translate(${x}px, ${y}px) scale(${sc})`;
   el._xy = [x, y, lw, lh];
 }
@@ -8743,7 +9576,8 @@ function initLegendDrag() {
   });
   el.addEventListener('pointermove', e => {
     if (!st || !el._xy) return;
-    const B = legendBox(), lw = el._xy[2], lh = el._xy[3];
+    let B = legendBox(), lw = el._xy[2], lh = el._xy[3];
+    if (B.w < 200 || B.h < 120) { const c = STATE.map.getContainer(); B = { x: 0, y: 0, w: c.clientWidth, h: c.clientHeight, k: 1 }; }
     const x = Math.max(B.x, Math.min(B.x + B.w - lw, st.x + e.clientX - st.px));
     const y = Math.max(B.y, Math.min(B.y + B.h - lh, st.y + e.clientY - st.py));
     const ax = x + lw / 2 < B.x + B.w / 2 ? 'l' : 'r', ay = y + lh / 2 < B.y + B.h / 2 ? 't' : 'b';
@@ -8760,11 +9594,11 @@ function initLegendDrag() {
 let _measureCtx = null;
 // Larghezza del testo in unità: misurata su canvas con lo stesso font dell'SVG
 // (Helvetica/Arial); stima a 0,54 em per carattere se il canvas non è disponibile.
-function textWidthUnits(s, px, bold) {
+function textWidthUnits(s, px, bold, family) {
   try {
     if (_measureCtx === null) { const c = document.createElement('canvas'); _measureCtx = c.getContext('2d') || false; }
     if (_measureCtx && _measureCtx.measureText) {
-      _measureCtx.font = `${bold ? 'bold ' : ''}${px}px Helvetica, Arial, sans-serif`;
+      _measureCtx.font = `${bold ? 'bold ' : ''}${px}px ${family || 'Helvetica, Arial, sans-serif'}`;
       const wpx = _measureCtx.measureText(String(s || '')).width;
       if (Number.isFinite(wpx) && wpx > 0) return wpx;
     }
@@ -8772,9 +9606,18 @@ function textWidthUnits(s, px, bold) {
   return String(s || '').length * px * 0.54;
 }
 function legendMetrics(L, entries) {
-  const lw = Math.max(120, Math.max(L.title ? textWidthUnits(L.title, LEGEND_TITLE_FONT, true) : 0, ...entries.map(e => textWidthUnits(e.label, LEGEND_FONT) + 33)) + LEGEND_PAD * 2);
-  const lh = (L.title ? 24 : 8) + entries.length * LEGEND_ROW + 8;
-  return { lw: r2(lw), lh: r2(lh) };
+  const st = legendStyle();
+  const textX = st.sw + st.gap;   // offset del testo rispetto al padding
+  const lw = Math.max(80, Math.max(L.title ? textWidthUnits(L.title, st.titleSize, true, st.family) : 0, ...entries.map(e => textWidthUnits(e.label, st.itemSize, false, st.family) + textX)) + st.padding * 2);
+  const titleH = L.title ? r2(st.titleSize * 1.9) : 8;
+  const lh = titleH + entries.length * st.row + 8;
+  return { lw: r2(lw), lh: r2(lh), titleH, textX };
+}
+// Rettangolo con raggi diversi per angolo, come path SVG
+function roundedRectPath(w, h, r) {
+  const c = v => Math.max(0, Math.min(v || 0, w / 2, h / 2));
+  const tl = c(r.tl), tr = c(r.tr), br = c(r.br), bl = c(r.bl);
+  return `M${r2(tl)},0 H${r2(w - tr)}${tr ? ` A${r2(tr)},${r2(tr)} 0 0 1 ${r2(w)},${r2(tr)}` : ''} V${r2(h - br)}${br ? ` A${r2(br)},${r2(br)} 0 0 1 ${r2(w - br)},${r2(h)}` : ''} H${r2(bl)}${bl ? ` A${r2(bl)},${r2(bl)} 0 0 1 0,${r2(h - bl)}` : ''} V${r2(tl)}${tl ? ` A${r2(tl)},${r2(tl)} 0 0 1 ${r2(tl)},0` : ''} Z`;
 }
 // Simboli che l'export deve definire anche se il layer non ha punti nel riquadro
 function legendLayerIds() {
@@ -8787,15 +9630,16 @@ function legendSvg(V) {
   if (!L.enabled) return '';
   const entries = legendEntries();
   if (!entries.length && !L.title) return '';
-  const { lw, lh } = legendMetrics(L, entries);
+  const st = legendStyle();
+  const { lw, lh, titleH, textX } = legendMetrics(L, entries);
   const sc = L.scale || 1, p = L.pos || defLegendPos(), W = V.W, H = V.H;
   const x = r2(Math.max(0, Math.min(W - lw * sc, p.ax === 'l' ? p.fx * W : W - p.fx * W - lw * sc)));
   const y = r2(Math.max(0, Math.min(H - lh * sc, p.ay === 't' ? p.fy * H : H - p.fy * H - lh * sc)));
-  const FONT = 'font-family="Helvetica, Arial, sans-serif"';
-  let o = `<g id="legenda" inkscape:label="Legenda" ${FONT} font-size="${LEGEND_FONT}" transform="translate(${x} ${y}) scale(${sc})">\n`;
-  if (L.bg !== false) o += `  <rect id="legenda-sfondo" width="${lw}" height="${lh}" rx="3" fill="#ffffff" fill-opacity="0.94" stroke="#9aa5b1" stroke-width="0.6"/>\n`;
+  const LEGEND_PAD = st.padding, LEGEND_SW = st.sw, LEGEND_ROW = st.row;
+  let o = `<g id="legenda" inkscape:label="Legenda" font-family="${escapeHtml(st.family)}" font-size="${st.itemSize}" transform="translate(${x} ${y}) scale(${sc})">\n`;
+  if (L.bg !== false) o += `  <path id="legenda-sfondo" d="${roundedRectPath(lw, lh, st.radius)}" fill="${st.bg}" fill-opacity="${st.bgOpacity}"${st.borderWidth > 0 ? ` stroke="${st.border}" stroke-width="${st.borderWidth}"` : ''}/>\n`;
   let yy = 8;
-  if (L.title) { o += `  <text x="${LEGEND_PAD}" y="${yy + 12}" font-weight="bold" font-size="${LEGEND_TITLE_FONT}" fill="#18222d">${escapeHtml(L.title)}</text>\n`; yy = 24; }
+  if (L.title) { o += `  <text x="${LEGEND_PAD}" y="${r2(8 + st.titleSize)}" font-weight="bold" font-size="${st.titleSize}" fill="${st.textColor}">${escapeHtml(L.title)}</text>\n`; yy = titleH; }
   for (const e of entries) {
     const it = e.it, ref = e.ref, cy = yy + LEGEND_ROW / 2;
     if (it.kind === 'layer') {
@@ -8810,12 +9654,13 @@ function legendSvg(V) {
       o += `  <rect x="${LEGEND_PAD}" y="${r2(cy - LEGEND_SW / 2)}" width="${LEGEND_SW}" height="${LEGEND_SW}" fill="${ref.color}" fill-opacity="${ref.opacity != null ? ref.opacity : 0.35}" stroke="${ref.color}" stroke-width="1"/>\n`;
     } else if (it.kind === 'boundary') {
       const wu = Math.min(6, Math.max(0.8, ref.strokeWidthMode === 'm' ? 2 : (ref.strokeWidth || 2)));
-      if ((ref.fillOpacity || 0) > 0) o += `  <rect x="${LEGEND_PAD + 1}" y="${r2(cy - 8)}" width="16" height="16" fill="${ref.color}" fill-opacity="${ref.fillOpacity}"/>\n`;
-      o += `  <path d="M${LEGEND_PAD + 1} ${r2(cy + 5)} L${LEGEND_PAD + 7} ${r2(cy - 4)} L${LEGEND_PAD + 11} ${r2(cy + 2)} L${LEGEND_PAD + 17} ${r2(cy - 6)}" fill="none" stroke="${ref.strokeColor}" stroke-width="${wu}"${ref.dashed ? ' stroke-dasharray="3,2"' : ''} stroke-linejoin="round" stroke-linecap="round"/>\n`;
+      const k = LEGEND_SW / 18;   // campione del confine in scala col font
+      if ((ref.fillOpacity || 0) > 0) o += `  <rect x="${r2(LEGEND_PAD + k)}" y="${r2(cy - 8 * k)}" width="${r2(16 * k)}" height="${r2(16 * k)}" fill="${ref.color}" fill-opacity="${ref.fillOpacity}"/>\n`;
+      o += `  <path d="M${r2(LEGEND_PAD + k)} ${r2(cy + 5 * k)} L${r2(LEGEND_PAD + 7 * k)} ${r2(cy - 4 * k)} L${r2(LEGEND_PAD + 11 * k)} ${r2(cy + 2 * k)} L${r2(LEGEND_PAD + 17 * k)} ${r2(cy - 6 * k)}" fill="none" stroke="${ref.strokeColor}" stroke-width="${r2(wu * k)}"${ref.dashed ? ' stroke-dasharray="3,2"' : ''} stroke-linejoin="round" stroke-linecap="round"/>\n`;
     } else {
       o += `  <rect x="${LEGEND_PAD}" y="${r2(cy - LEGEND_SW / 2)}" width="${LEGEND_SW}" height="${LEGEND_SW}" fill="${it.color || '#888888'}" stroke="#9aa5b1" stroke-width="0.6"/>\n`;
     }
-    o += `  <text x="${LEGEND_PAD + LEGEND_SW + 9}" y="${r2(cy + 4)}" fill="#18222d">${escapeHtml(e.label)}</text>\n`;
+    o += `  <text x="${r2(LEGEND_PAD + textX)}" y="${r2(cy + st.itemSize * 0.35)}" fill="${st.textColor}">${escapeHtml(e.label)}</text>\n`;
     yy += LEGEND_ROW;
   }
   return o + `</g>\n`;
@@ -9168,16 +10013,14 @@ function buildExportSvg(V, baseDataUrl, opts) {
   if (STATE.spotlight.enabled) {
     const visibleBoundaries = STATE.boundaries.filter(b => b.visible);
     if (visibleBoundaries.length) {
-      let union = visibleBoundaries[0].feature;
-      for (let i = 1; i < visibleBoundaries.length; i++) {
-        try { union = turf.union(turf.featureCollection([union, visibleBoundaries[i].feature])) || union; } catch (e) {}
-      }
+      const union = unionAll(visibleBoundaries.map(b => boundaryFeature(b)));
       const world = turf.polygon([[[-180,-85],[180,-85],[180,85],[-180,85],[-180,-85]]]);
       let mask = null;
       try { mask = turf.difference(turf.featureCollection([world, union])); } catch (e) {}
       if (mask) {
         svg += `<g id="spotlight" inkscape:label="Spotlight">\n`;
         svg += geometryToSvgPath(mask.geometry, project, {
+          curveErr: 0.75,
           fill: STATE.spotlight.color,
           fillOpacity: STATE.spotlight.opacity,
           stroke: 'none',
@@ -9194,13 +10037,15 @@ function buildExportSvg(V, baseDataUrl, opts) {
     for (const b of visBoundaries) {
       svg += `  <g id="boundary-${idOf(b.name)}" inkscape:label="${escapeHtml(b.name || 'Confine')}">\n`;
       if ((b.fillOpacity || 0) > 0) {
-        svg += '    ' + geometryToSvgPath(b.feature.geometry, project, {
+        svg += '    ' + geometryToSvgPath(boundaryFeature(b).geometry, project, {
+          curveErr: b.simplify ? b.simplify / V.metersPerUnit : 0.75,
           fill: b.color,
           fillOpacity: b.fillOpacity,
           stroke: 'none',
         });
       }
-      svg += '    ' + geometryToSvgPath(b.feature.geometry, project, {
+      svg += '    ' + geometryToSvgPath(boundaryFeature(b).geometry, project, {
+        curveErr: b.simplify ? b.simplify / V.metersPerUnit : 0.75,
         fill: 'none',
         stroke: b.strokeColor,
         strokeWidth: strokeUnits(b, V),
@@ -9219,8 +10064,9 @@ function buildExportSvg(V, baseDataUrl, opts) {
     svg += `<g id="isochrones" inkscape:label="Isocrone">\n`;
     for (const iso of visIsos) {
       svg += `  <g id="iso-${idOf(iso.name)}" inkscape:label="${escapeHtml(iso.name || 'Isocrona')}">\n`;
-      iso.geojson.features.forEach((f, fi) => {
+      isoFeatures(iso).forEach((f, fi) => {
         svg += '    ' + geometryToSvgPath(f.geometry, project, {
+          curveErr: iso.simplify ? iso.simplify / V.metersPerUnit : 0.75,
           fill: iso.color,
           fillOpacity: iso.opacity,
           stroke: iso.color,
@@ -9340,12 +10186,31 @@ function extractSvgInner(svgString) {
 }
 
 function geometryToSvgPath(geom, project, style) {
-  const ringToPath = (ring) => {
-    return ring.map((c, i) => {
+  const polylineRing = (ring) => ring.map((c, i) => {
+    const p = project(c[0], c[1]);
+    return (i === 0 ? 'M' : 'L') + p.x.toFixed(2) + ',' + p.y.toFixed(2);
+  }).join(' ') + ' Z';
+  // Anello come curve di Bézier cubiche (Schneider via fitCurve): pochi nodi lisci
+  // entro curveErr unità. Ripiega alla spezzata per anelli minuscoli o enormi.
+  const bezierRing = (ring) => {
+    const pts = [];
+    for (const c of ring) {
       const p = project(c[0], c[1]);
-      return (i === 0 ? 'M' : 'L') + p.x.toFixed(2) + ',' + p.y.toFixed(2);
-    }).join(' ') + ' Z';
+      if (!pts.length || Math.abs(p.x - pts[pts.length - 1][0]) > 1e-6 || Math.abs(p.y - pts[pts.length - 1][1]) > 1e-6) pts.push([p.x, p.y]);
+    }
+    if (pts.length > 1 && Math.abs(pts[0][0] - pts[pts.length - 1][0]) < 1e-6 && Math.abs(pts[0][1] - pts[pts.length - 1][1]) < 1e-6) pts.pop();
+    if (pts.length < 4 || pts.length > 8000 || typeof fitCurve !== 'function') return polylineRing(ring);
+    pts.push(pts[0]);   // chiuso
+    let segs;
+    try { segs = fitCurve(pts, Math.pow(style.curveErr || 0.75, 2)); } catch (e) { return polylineRing(ring); }
+    if (!segs || !segs.length) return polylineRing(ring);
+    const f = n => (Math.round(n * 100) / 100).toString();
+    let d = 'M' + f(segs[0][0][0]) + ',' + f(segs[0][0][1]);
+    for (const s of segs) d += ' C' + f(s[1][0]) + ',' + f(s[1][1]) + ' ' + f(s[2][0]) + ',' + f(s[2][1]) + ' ' + f(s[3][0]) + ',' + f(s[3][1]);
+    return d + ' Z';
   };
+  const useCurves = style.curves != null ? style.curves : (document.getElementById('exportCurves') || {}).checked;
+  const ringToPath = useCurves ? bezierRing : polylineRing;
   let d = '';
   if (geom.type === 'Polygon') {
     d = geom.coordinates.map(ringToPath).join(' ');
@@ -9828,7 +10693,7 @@ function buildKmlExport() {
         <Placemark>
           <name>${escapeXml(b.name)}</name>
           <styleUrl>#bnd_${b.id}</styleUrl>
-          ${geometryToKml(b.feature.geometry)}
+          ${geometryToKml(boundaryFeature(b).geometry)}
         </Placemark>
       `);
     }
@@ -9840,7 +10705,7 @@ function buildKmlExport() {
   if (visIsos.length) {
     xml.push(`<Folder><name>Isocrone</name>`);
     for (const iso of visIsos) {
-      for (const f of iso.geojson.features) {
+      for (const f of isoFeatures(iso)) {
         xml.push(`
           <Placemark>
             <name>${escapeXml(iso.name)}</name>
@@ -10674,6 +11539,7 @@ function buildProjectJson() {
     strokeWidthMode: b.strokeWidthMode || 'px',
     dashed: !!b.dashed,
     strokeAlignment: b.strokeAlignment || 'center',
+    simplify: b.simplify || 0,
     visible: b.visible !== false,
   }));
   const isochrones = STATE.isochrones.map(i => ({
@@ -10687,6 +11553,7 @@ function buildProjectJson() {
     profile: i.profile,
     provider: i.provider,
     strokeWidth: i.strokeWidth,
+    simplify: i.simplify || 0,
     color: i.color,
     opacity: i.opacity,
     geojson: i.geojson,
@@ -10718,6 +11585,7 @@ function buildProjectJson() {
       exportAttr: document.getElementById('exportAttr').checked,
       exportGray: document.getElementById('exportGray').checked,
       exportPxScale: exportPxScale(),
+      exportCurves: document.getElementById('exportCurves').checked,
     },
     layers, boundaries, isochrones,
   };
@@ -10951,6 +11819,7 @@ function applyMergeSelection(project, picks) {
         strokeWidthMode: b.strokeWidthMode || 'px',
         dashed: !!b.dashed,
         strokeAlignment: b.strokeAlignment || 'center',
+        simplify: b.simplify || 0,
         visible: b.visible !== false,
       });
       addedB++;
@@ -10970,6 +11839,7 @@ function applyMergeSelection(project, picks) {
         profile: iso.profile,
         provider: iso.provider,
         strokeWidth: iso.strokeWidth,
+        simplify: iso.simplify || 0,
         color: iso.color || '#0d99ff',
         opacity: iso.opacity != null ? iso.opacity : 0.35,
         geojson: iso.geojson,
@@ -11055,6 +11925,7 @@ function applyProjectJson(project) {
       strokeWidthMode: b.strokeWidthMode || 'px',
       dashed: !!b.dashed,
       strokeAlignment: b.strokeAlignment || 'center',
+      simplify: b.simplify || 0,
       visible: b.visible !== false,
     });
   }
@@ -11071,6 +11942,7 @@ function applyProjectJson(project) {
       profile: i.profile,
       provider: i.provider,
       strokeWidth: i.strokeWidth,
+      simplify: i.simplify || 0,
       color: i.color || '#0d99ff',
       opacity: i.opacity != null ? i.opacity : 0.35,
       geojson: i.geojson,
@@ -11093,6 +11965,7 @@ function applyProjectJson(project) {
   if (s.exportScale) document.getElementById('exportScale').value = s.exportScale;
   for (const k of ['exportEmbedBg', 'exportAttr', 'exportGray']) if (s[k] != null) document.getElementById(k).checked = !!s[k];
   if (s.exportPxScale) document.getElementById('exportPxScale').value = s.exportPxScale;
+  if (s.exportCurves != null) document.getElementById('exportCurves').checked = !!s.exportCurves;
   if (s.strokeStyle) STATE.strokeStyle = { ...s.strokeStyle };
   if (s.mapLanguage) STATE.mapLanguage = s.mapLanguage;
 
